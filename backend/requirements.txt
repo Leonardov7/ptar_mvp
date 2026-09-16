@@ -1,0 +1,25 @@
+# Framework Web y Servidor
+fastapi==0.110.1
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+pydantic-settings==2.3.0
+
+# Procesamiento de Documentos Complejos
+docling==1.1.0
+
+# Orquestación de Modelos de Lenguaje (LLM) y Vectores
+langchain==0.1.16
+langchain-community==0.0.34
+sentence-transformers==2.7.0
+
+# Base de Datos y ORM
+SQLAlchemy==2.0.29
+psycopg2-binary==2.9.9
+pgvector==0.2.5
+
+# Manejo de Asincronía y WebSockets
+websockets==12.0
+
+# Utilidades de archivos y peticiones HTTP
+python-multipart==0.0.9
+requests==2.32.3

@@ -1,0 +1,59 @@
+services:
+  # 1. Servidor de Inferencia Local (Ollama)
+  llm_engine:
+    image: ollama/ollama:latest
+    container_name: ptar_llm_engine
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  # 2. Base de Datos Relacional y Vectorial (PostgreSQL + pgvector)
+  vector_db:
+    image: ankane/pgvector:latest
+    container_name: ptar_vector_db
+    environment:
+      POSTGRES_USER: ptar_admin
+      POSTGRES_PASSWORD: ptar_secure_password
+      POSTGRES_DB: ptar_knowledge_base
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # 3. Orquestador Backend (FastAPI + IBM Docling + LangChain)
+  backend_api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ptar_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://ptar_admin:ptar_secure_password@vector_db:5432/ptar_knowledge_base
+      - OLLAMA_BASE_URL=http://llm_engine:11434
+      - LLM_MODEL_NAME=llama3
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - vector_db
+      - llm_engine
+    restart: unless-stopped
+
+  # 4. Interfaz de Usuario (Vue.js 3 + Nginx)
+  frontend_ui:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ptar_frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend_api
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  pg_data:
