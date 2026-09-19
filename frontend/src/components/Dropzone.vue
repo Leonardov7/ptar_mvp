@@ -1,8 +1,8 @@
 <template>
   <div class="dropzone-container">
     <div class="component-header">
-      <h3>Ingesta Normativa (RAG)</h3>
-      <p>Vectorización de manuales técnicos y resoluciones gubernamentales.</p>
+      <h3>Ingesta Normativa</h3>
+      <p>Procesamiento de manuales técnicos y resoluciones gubernamentales.</p>
     </div>
 
     <div 
@@ -28,15 +28,19 @@
           <line x1="12" y1="18" x2="12" y2="12"></line>
           <line x1="9" y1="15" x2="15" y2="15"></line>
         </svg>
-        <p>Arrastre un archivo PDF aquí, o haga clic para seleccionar.</p>
-        <small>Solo se procesarán documentos teóricos para el fallback estructurado.</small>
+        <p v-if="!selectedFile">Arrastre un archivo PDF aquí, o haga clic para seleccionar.</p>
+        <p v-else class="selected-file-name">Documento cargado: {{ selectedFile.name }}</p>
       </div>
 
       <div v-else class="processing-content">
         <div class="spinner"></div>
-        <p>Procesando con IBM Docling...</p>
-        <small>Extrayendo tablas, ejecutando chunking y vectorizando texto.</small>
+        <p>Procesando documento...</p>
       </div>
+    </div>
+
+    <div class="action-bar" v-if="selectedFile && !isProcessing">
+      <button class="btn-process" @click="processFile">Procesar Documento</button>
+      <button class="btn-cancel" @click="clearSelection">Cancelar</button>
     </div>
 
     <div v-if="resultMessage" :class="['result-message', resultType]">
@@ -54,6 +58,7 @@ const isProcessing = ref(false);
 const resultMessage = ref('');
 const resultType = ref('');
 const fileInput = ref(null);
+const selectedFile = ref(null);
 
 const triggerFileInput = () => {
   if (!isProcessing.value) {
@@ -61,37 +66,43 @@ const triggerFileInput = () => {
   }
 };
 
-const handleDrop = async (event) => {
+const handleDrop = (event) => {
   isDragging.value = false;
   const files = event.dataTransfer.files;
-  if (files.length > 0) {
-    await processFile(files[0]);
+  if (files.length > 0 && files[0].type === 'application/pdf') {
+    selectedFile.value = files[0];
+    resultMessage.value = '';
+  } else {
+    resultType.value = 'error';
+    resultMessage.value = 'Formato inválido. Solo se admiten archivos PDF.';
   }
 };
 
-const handleFileSelect = async (event) => {
+const handleFileSelect = (event) => {
   const files = event.target.files;
   if (files.length > 0) {
-    await processFile(files[0]);
+    selectedFile.value = files[0];
+    resultMessage.value = '';
   }
-  // Limpiar el input para permitir subir el mismo archivo si hubo error
   fileInput.value.value = '';
 };
 
-const processFile = async (file) => {
-  if (file.type !== 'application/pdf') {
-    resultType.value = 'error';
-    resultMessage.value = 'Formato inválido. Solo se admiten archivos PDF.';
-    return;
-  }
+const clearSelection = () => {
+  selectedFile.value = null;
+  resultMessage.value = '';
+};
+
+const processFile = async () => {
+  if (!selectedFile.value) return;
 
   isProcessing.value = true;
   resultMessage.value = '';
 
   try {
-    const response = await api.uploadManual(file);
+    const response = await api.uploadManual(selectedFile.value);
     resultType.value = 'success';
-    resultMessage.value = `Documento vectorizado en ${response.processing_time_seconds}s. Chunks creados: ${response.chunks_created}.`;
+    resultMessage.value = `Documento procesado correctamente.`;
+    selectedFile.value = null;
   } catch (error) {
     resultType.value = 'error';
     const serverDetail = error.response?.data?.detail || error.message;
@@ -154,6 +165,11 @@ const processFile = async (file) => {
   font-weight: 500;
 }
 
+.selected-file-name {
+  color: #2980b9 !important;
+  font-weight: bold !important;
+}
+
 .drop-content small, .processing-content small {
   color: #7f8c8d;
 }
@@ -171,6 +187,42 @@ const processFile = async (file) => {
 @keyframes spin {
   0% { transform: rotate(0deg); }
   100% { transform: rotate(360deg); }
+}
+
+.action-bar {
+  display: flex;
+  gap: 10px;
+  margin-top: 15px;
+}
+
+.btn-process {
+  flex: 1;
+  background-color: #3498db;
+  color: white;
+  border: none;
+  padding: 10px;
+  border-radius: 4px;
+  font-weight: bold;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.btn-process:hover {
+  background-color: #2980b9;
+}
+
+.btn-cancel {
+  background-color: #ecf0f1;
+  color: #7f8c8d;
+  border: 1px solid #bdc3c7;
+  padding: 10px 15px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.btn-cancel:hover {
+  background-color: #e0e6ed;
 }
 
 .result-message {

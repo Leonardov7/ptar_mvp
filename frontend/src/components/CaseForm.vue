@@ -1,71 +1,98 @@
 <template>
-  <div class="case-form-container">
-    <div class="form-header">
-      <h2>Registro de Bitácora Empírica</h2>
-      <p>Documente las intervenciones operativas para alimentar el Razonamiento Basado en Casos (CBR).</p>
+  <div class="case-form-wrapper">
+    <div class="trigger-container">
+      <div class="component-header">
+        <h3>Bitácora Operativa</h3>
+        <p>Almacenamiento de experiencia tácita en planta.</p>
+      </div>
+      <button class="btn-open-modal" @click="isModalOpen = true">
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"></line>
+          <line x1="5" y1="12" x2="19" y2="12"></line>
+        </svg>
+        Registrar Nueva Bitácora
+      </button>
     </div>
 
-    <form @submit.prevent="submitCase" class="cbr-form">
-      <div class="form-group">
-        <label for="author">Identificador del Operario:</label>
-        <input 
-          type="text" 
-          id="author" 
-          v-model="formData.author" 
-          placeholder="Ej: Ing. Juan Pérez / Turno Noche" 
-          required 
-          :disabled="isSubmitting"
-        />
-      </div>
+    <div v-if="isModalOpen" class="modal-overlay" @click.self="closeModal">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2>Registro de Bitácora Operativa</h2>
+          <button class="btn-close" @click="closeModal">&times;</button>
+        </div>
+        
+        <p class="modal-description">Documente las fallas y soluciones aplicadas en la planta para conocimiento futuro.</p>
 
-      <div class="form-group">
-        <label for="symptoms">Síntomas del Sistema (Vector de Estado):</label>
-        <textarea 
-          id="symptoms" 
-          v-model="formData.symptoms" 
-          rows="3" 
-          placeholder="Describa la falla detalladamente (Ej: Aumento de turbidez, DBO5 elevada, pérdida de biomasa)." 
-          required
-          :disabled="isSubmitting"
-        ></textarea>
-      </div>
+        <form @submit.prevent="submitCase" class="cbr-form">
+          <div class="form-group">
+            <label for="author">Identificador del Operario:</label>
+            <input 
+              type="text" 
+              id="author" 
+              v-model="formData.author" 
+              placeholder="Ej: Ing. Juan Pérez / Turno Noche" 
+              required 
+              :disabled="isSubmitting"
+            />
+          </div>
 
-      <div class="form-group">
-        <label for="action">Acción Heurística Ejecutada:</label>
-        <textarea 
-          id="action" 
-          v-model="formData.action_taken" 
-          rows="3" 
-          placeholder="¿Qué acciones empíricas realizó? (Ej: Cierre de purga por 2 horas, incremento de aireación al 80%)." 
-          required
-          :disabled="isSubmitting"
-        ></textarea>
-      </div>
+          <div class="form-group">
+            <label for="symptoms">Síntomas del Sistema:</label>
+            <textarea 
+              id="symptoms" 
+              v-model="formData.symptoms" 
+              rows="3" 
+              placeholder="Describa la falla detalladamente (Ej: Aumento de turbidez, DBO5 elevada)." 
+              required
+              :disabled="isSubmitting"
+            ></textarea>
+          </div>
 
-      <div class="form-group">
-        <label for="result">Resultado Operativo:</label>
-        <textarea 
-          id="result" 
-          v-model="formData.result" 
-          rows="2" 
-          placeholder="Describa el estado final del reactor (Ej: Estabilización del manto de lodos, corrección del parámetro)." 
-          required
-          :disabled="isSubmitting"
-        ></textarea>
-      </div>
+          <div class="form-group">
+            <label for="action">Acción Ejecutada:</label>
+            <textarea 
+              id="action" 
+              v-model="formData.action_taken" 
+              rows="3" 
+              placeholder="¿Qué acciones realizó? (Ej: Cierre de purga por 2 horas)." 
+              required
+              :disabled="isSubmitting"
+            ></textarea>
+          </div>
 
-      <div class="form-actions">
-        <button type="submit" class="btn-submit" :disabled="isSubmitting">
-          <span v-if="!isSubmitting">Indexar Caso en Base de Conocimiento</span>
-          <span v-else>Vectorizando Caso...</span>
-        </button>
-      </div>
+          <div class="form-group">
+            <label for="result">Resultado Operativo:</label>
+            <textarea 
+              id="result" 
+              v-model="formData.result" 
+              rows="2" 
+              placeholder="Describa el estado final del equipo tras la acción." 
+              required
+              :disabled="isSubmitting"
+            ></textarea>
+          </div>
 
-      <!-- Retroalimentación visual de la transacción -->
-      <div v-if="notification.message" :class="['notification', notification.type]">
-        {{ notification.message }}
+          <div v-if="isSubmitting" class="progress-container">
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill" :style="{ width: progress + '%' }"></div>
+            </div>
+            <span class="progress-text">Guardando información... {{ progress }}%</span>
+          </div>
+
+          <div class="form-actions">
+            <button type="button" class="btn-cancel" @click="closeModal" :disabled="isSubmitting">Cancelar</button>
+            <button type="submit" class="btn-submit" :disabled="isSubmitting">
+              <span v-if="!isSubmitting">Guardar Registro</span>
+              <span v-else>Procesando...</span>
+            </button>
+          </div>
+
+          <div v-if="notification.message" :class="['notification', notification.type]">
+            {{ notification.message }}
+          </div>
+        </form>
       </div>
-    </form>
+    </div>
   </div>
 </template>
 
@@ -73,7 +100,8 @@
 import { ref, reactive } from 'vue';
 import api from '../services/api.js';
 
-// Estado reactivo del formulario, enlazado bidireccionalmente con los inputs
+const isModalOpen = ref(false);
+
 const formData = reactive({
   author: '',
   symptoms: '',
@@ -81,20 +109,42 @@ const formData = reactive({
   result: ''
 });
 
-// Controladores de estado de la interfaz
 const isSubmitting = ref(false);
+const progress = ref(0);
+let progressInterval = null;
+
 const notification = reactive({
   message: '',
-  type: '' // 'success' o 'error'
+  type: ''
 });
 
-/**
- * Procesa el envío del formulario, bloquea interacciones repetidas
- * y gestiona la respuesta asíncrona del backend.
- */
+const closeModal = () => {
+  if (!isSubmitting.value) {
+    isModalOpen.value = false;
+    notification.message = '';
+    progress.value = 0;
+  }
+};
+
+const simulateProgress = () => {
+  progress.value = 0;
+  progressInterval = setInterval(() => {
+    if (progress.value < 90) {
+      progress.value += Math.floor(Math.random() * 15) + 5;
+      if (progress.value > 90) progress.value = 90;
+    }
+  }, 400);
+};
+
+const stopProgress = () => {
+  clearInterval(progressInterval);
+  progress.value = 100;
+};
+
 const submitCase = async () => {
   isSubmitting.value = true;
   notification.message = '';
+  simulateProgress();
   
   try {
     const response = await api.submitEmpiricalCase({
@@ -104,23 +154,24 @@ const submitCase = async () => {
       result: formData.result
     });
     
-    // Éxito: limpiar el formulario (excepto el autor) y notificar
+    stopProgress();
     notification.type = 'success';
-    notification.message = `Caso empírico indexado exitosamente (ID Vectorial: ${response.id}). Estructura CBR actualizada.`;
+    notification.message = `Registro guardado exitosamente (ID: ${response.id}).`;
     
     formData.symptoms = '';
     formData.action_taken = '';
     formData.result = '';
     
-    // Ocultar notificación de éxito tras 5 segundos
     setTimeout(() => {
-      notification.message = '';
-    }, 5000);
+      closeModal();
+    }, 2000);
     
   } catch (error) {
+    clearInterval(progressInterval);
+    progress.value = 0;
     notification.type = 'error';
     const serverDetail = error.response?.data?.detail || error.message;
-    notification.message = `Fallo crítico de indexación: ${serverDetail}`;
+    notification.message = `Fallo al guardar: ${serverDetail}`;
   } finally {
     isSubmitting.value = false;
   }
@@ -128,37 +179,115 @@ const submitCase = async () => {
 </script>
 
 <style scoped>
-.case-form-container {
+.trigger-container {
   background-color: #ffffff;
   border-radius: 8px;
-  box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-  padding: 24px;
-  max-width: 800px;
-  margin: 0 auto;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  padding: 20px;
+  margin-bottom: 20px;
+  border-left: 4px solid #2ecc71;
 }
 
-.form-header h2 {
+.component-header h3 {
   margin-top: 0;
+  margin-bottom: 5px;
   color: #2c3e50;
-  font-size: 1.5rem;
-  border-bottom: 2px solid #3498db;
-  padding-bottom: 8px;
+  font-size: 1.1rem;
 }
 
-.form-header p {
+.component-header p {
+  color: #7f8c8d;
+  font-size: 0.85rem;
+  margin-bottom: 15px;
+  margin-top: 0;
+}
+
+.btn-open-modal {
+  width: 100%;
+  background-color: #2ecc71;
+  color: white;
+  border: none;
+  padding: 12px;
+  font-size: 1rem;
+  font-weight: bold;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  transition: background-color 0.2s;
+}
+
+.btn-open-modal:hover {
+  background-color: #27ae60;
+}
+
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background-color: rgba(0, 0, 0, 0.6);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+.modal-content {
+  background-color: white;
+  padding: 30px;
+  border-radius: 12px;
+  width: 90%;
+  max-width: 600px;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 2px solid #2ecc71;
+  padding-bottom: 10px;
+  margin-bottom: 10px;
+}
+
+.modal-header h2 {
+  margin: 0;
+  color: #2c3e50;
+  font-size: 1.4rem;
+}
+
+.btn-close {
+  background: none;
+  border: none;
+  font-size: 1.8rem;
+  color: #7f8c8d;
+  cursor: pointer;
+}
+
+.btn-close:hover {
+  color: #e74c3c;
+}
+
+.modal-description {
   color: #7f8c8d;
   font-size: 0.9rem;
-  margin-bottom: 24px;
+  margin-bottom: 20px;
 }
 
 .form-group {
-  margin-bottom: 20px;
+  margin-bottom: 15px;
 }
 
 label {
   display: block;
   font-weight: 600;
-  margin-bottom: 8px;
+  margin-bottom: 5px;
   color: #34495e;
 }
 
@@ -169,44 +298,58 @@ textarea {
   border: 1px solid #bdc3c7;
   border-radius: 4px;
   font-family: inherit;
-  font-size: 1rem;
+  font-size: 0.95rem;
   box-sizing: border-box;
-  transition: border-color 0.3s ease;
 }
 
 input[type="text"]:focus,
 textarea:focus {
   outline: none;
-  border-color: #3498db;
-  box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.2);
+  border-color: #2ecc71;
+  box-shadow: 0 0 0 2px rgba(46, 204, 113, 0.2);
 }
 
-input:disabled,
-textarea:disabled {
+.progress-container {
+  margin-top: 15px;
+  margin-bottom: 15px;
+}
+
+.progress-bar-bg {
+  width: 100%;
+  height: 8px;
   background-color: #ecf0f1;
-  cursor: not-allowed;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 5px;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background-color: #2ecc71;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: 0.8rem;
+  color: #7f8c8d;
+  font-weight: bold;
 }
 
 .form-actions {
   display: flex;
   justify-content: flex-end;
-  margin-top: 24px;
+  gap: 15px;
+  margin-top: 25px;
 }
 
 .btn-submit {
   background-color: #2980b9;
   color: white;
   border: none;
-  padding: 12px 24px;
-  font-size: 1rem;
-  font-weight: 600;
+  padding: 10px 20px;
+  font-weight: bold;
   border-radius: 4px;
   cursor: pointer;
-  transition: background-color 0.3s ease;
-}
-
-.btn-submit:hover:not(:disabled) {
-  background-color: #3498db;
 }
 
 .btn-submit:disabled {
@@ -214,9 +357,19 @@ textarea:disabled {
   cursor: wait;
 }
 
+.btn-cancel {
+  background-color: white;
+  color: #7f8c8d;
+  border: 1px solid #bdc3c7;
+  padding: 10px 20px;
+  font-weight: bold;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
 .notification {
-  margin-top: 16px;
-  padding: 12px;
+  margin-top: 15px;
+  padding: 10px;
   border-radius: 4px;
   font-weight: 500;
 }

@@ -18,7 +18,8 @@ services:
       POSTGRES_PASSWORD: ptar_secure_password
       POSTGRES_DB: ptar_knowledge_base
     ports:
-      - "5432:5432"
+      # Puerto modificado a 5455 para evadir colisiones en tu entorno de desarrollo
+      - "5455:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -29,8 +30,10 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: ptar_backend
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
     ports:
-      - "8000:8000"
+      # Puerto modificado a 8055 para evadir colisiones en tu entorno de desarrollo
+      - "8055:8000"
     environment:
       - DATABASE_URL=postgresql://ptar_admin:ptar_secure_password@vector_db:5432/ptar_knowledge_base
       - OLLAMA_BASE_URL=http://llm_engine:11434
@@ -49,7 +52,8 @@ services:
       dockerfile: Dockerfile
     container_name: ptar_frontend
     ports:
-      - "8080:80"
+      # Puerto 810 asignado según tu directiva
+      - "810:80"
     depends_on:
       - backend_api
     restart: unless-stopped

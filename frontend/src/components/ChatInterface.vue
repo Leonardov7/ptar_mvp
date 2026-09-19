@@ -14,15 +14,15 @@
           <p class="text-body">{{ msg.content }}</p>
           
           <div v-if="msg.role === 'assistant' && msg.metadata" class="metadata-box">
-            <span class="strategy-badge" :class="msg.metadata.routing_strategy">
-              Estrategia Aplicada: {{ msg.metadata.routing_strategy }}
+            <span class="strategy-badge" :class="msg.metadata.routing_strategy === 'Manuales y Normativa' ? 'RAG' : 'CBR'">
+              Fuente: {{ msg.metadata.routing_strategy }}
             </span>
             <details v-if="msg.metadata.sources && msg.metadata.sources.length > 0">
-              <summary>Fuentes Recuperadas ({{ msg.metadata.sources.length }})</summary>
+              <summary>Archivos Recuperados ({{ msg.metadata.sources.length }})</summary>
               <ul class="sources-list">
                 <li v-for="(source, idx) in msg.metadata.sources" :key="idx">
                   <strong>Origen:</strong> {{ source.author }} <br>
-                  <strong>Similitud:</strong> {{(source.similarity * 100).toFixed(2)}}%
+                  <strong>Nivel de coincidencia:</strong> {{(source.similarity * 100).toFixed(2)}}%
                 </li>
               </ul>
             </details>
@@ -80,7 +80,7 @@ const connectWebSocket = () => {
   connectionStatus.value = 'connecting';
   connectionStatusText.value = 'Conectando al Motor Local...';
   
-  socket = new WebSocket('ws://localhost:8000/ws/v1/stream');
+  socket = new WebSocket('ws://localhost:8055/ws/v1/stream');
 
   socket.onopen = () => {
     connectionStatus.value = 'connected';
@@ -90,25 +90,25 @@ const connectWebSocket = () => {
   socket.onmessage = (event) => {
     const data = JSON.parse(event.data);
 
-    if (data.error) {
-      messages.value.push({ role: 'assistant', content: `[Error del Servidor]: ${data.error}` });
+    // CORRECCIÓN: Verifica el tipo exacto enviado por el backend
+    if (data.type === 'error') {
+      messages.value.push({ role: 'assistant', content: `[Error del Servidor]: ${data.content}` });
       isTyping.value = false;
       scrollToBottom();
       return;
     }
 
     if (data.type === 'metadata') {
-      // Inicia un nuevo mensaje del asistente con la metadata del CBR/RAG
       messages.value.push({
         role: 'assistant',
         content: '',
         metadata: {
-          routing_strategy: data.routing_strategy,
+          routing_strategy: data.strategy,
           sources: data.sources_used
         }
       });
       currentAssistantMessageIndex = messages.value.length - 1;
-      isTyping.value = false; // Ya empezamos a recibir texto real
+      isTyping.value = false; 
     } 
     else if (data.type === 'token') {
       if (currentAssistantMessageIndex !== -1) {
@@ -124,13 +124,12 @@ const connectWebSocket = () => {
   socket.onclose = () => {
     connectionStatus.value = 'disconnected';
     connectionStatusText.value = 'Conexión Perdida. Reconectando...';
-    setTimeout(connectWebSocket, 5000); // Intento de reconexión
+    setTimeout(connectWebSocket, 5000); 
   };
 
   socket.onerror = (error) => {
     connectionStatus.value = 'error';
     connectionStatusText.value = 'Fallo de Red';
-    console.error('WebSocket Error:', error);
   };
 };
 
@@ -145,9 +144,9 @@ const sendMessage = () => {
   scrollToBottom();
 
   const payload = {
-    query: query,
-    user_profile: props.equalizerSettings.userProfile,
-    similarity_threshold: props.equalizerSettings.similarityThreshold
+    message: query,
+    profile: props.equalizerSettings.userProfile,
+    threshold: props.equalizerSettings.similarityThreshold
   };
 
   socket.send(JSON.stringify(payload));
@@ -160,7 +159,6 @@ const scrollToBottom = async () => {
   }
 };
 
-// Auto-scroll durante el stream de tokens
 watch(messages, () => {
   if (currentAssistantMessageIndex !== -1) {
     scrollToBottom();

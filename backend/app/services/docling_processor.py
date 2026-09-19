@@ -4,10 +4,8 @@ import logging
 from typing import Optional, Dict, Any
 from pathlib import Path
 
-# Importación de la librería principal de IBM Docling
-from docling.document_converter import DocumentConverter
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
+# Las importaciones globales de IBM Docling han sido retiradas de la cabecera 
+# para aislar el hilo principal de Uvicorn y aplicar inicialización diferida (Lazy Loading).
 
 logger = logging.getLogger(__name__)
 
@@ -19,21 +17,34 @@ class DoclingProcessor:
     """
 
     def __init__(self):
-        # Configuración de las opciones del pipeline para PDFs
-        self.pipeline_options = PdfPipelineOptions()
-        self.pipeline_options.do_table_structure = True
-        self.pipeline_options.do_ocr = True
-        
-        # Inicialización del convertidor de documentos
-        try:
-            self.converter = DocumentConverter(
-                allowed_formats=[InputFormat.PDF],
-                # Se pueden inyectar las opciones de pipeline aquí dependiendo de la versión de docling
-            )
-            logger.info("IBM Docling DocumentConverter inicializado correctamente.")
-        except Exception as e:
-            logger.error(f"Error crítico al inicializar Docling: {str(e)}")
-            raise e
+        # Inicialización en nulo del convertidor de documentos para proteger el servidor
+        self.converter = None
+
+    def _get_converter(self):
+        """
+        Importa e instancia el motor de conversión únicamente cuando se recibe el primer documento.
+        Evade dependencias obsoletas como 'InputFormat' ajustándose a la API moderna de Docling.
+        """
+        if self.converter is None:
+            logger.info("Importando motor IBM Docling y modelos en tiempo de ejecución...")
+            try:
+                from docling.document_converter import DocumentConverter
+                from docling.datamodel.pipeline_options import PdfPipelineOptions
+                
+                # Configuración de las opciones del pipeline para PDFs
+                pipeline_options = PdfPipelineOptions()
+                pipeline_options.do_table_structure = True
+                pipeline_options.do_ocr = True
+                
+                # Inicialización del convertidor de documentos (soporta PDF de forma nativa)
+                # Se omite allowed_formats=[InputFormat.PDF] para prevenir el ImportError de rutas obsoletas.
+                self.converter = DocumentConverter()
+                
+                logger.info("IBM Docling DocumentConverter inicializado correctamente.")
+            except Exception as e:
+                logger.error(f"Error crítico al inicializar Docling: {str(e)}")
+                raise e
+        return self.converter
 
     async def process_pdf_to_markdown(self, file_path: str) -> Dict[str, Any]:
         """
@@ -54,9 +65,12 @@ class DoclingProcessor:
         logger.info(f"Iniciando decodificación estructural del documento: {file_path}")
 
         try:
+            # Invoca el método de importación diferida en tiempo real
+            converter = self._get_converter()
+            
             # La conversión en Docling puede ser un proceso bloqueante pesado.
             # En un entorno de producción estricto con FastAPI, esto podría envolverse en run_in_threadpool
-            conversion_result = self.converter.convert(file_path)
+            conversion_result = converter.convert(file_path)
             
             # Exportar el documento decodificado a formato Markdown
             markdown_content = conversion_result.document.export_to_markdown()

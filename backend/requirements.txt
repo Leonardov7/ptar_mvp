@@ -4,8 +4,9 @@ uvicorn[standard]==0.29.0
 pydantic==2.7.1
 pydantic-settings==2.3.0
 
-# Procesamiento de Documentos Complejos
+# Procesamiento de Documentos Complejos y Toolkit Base
 docling==1.1.0
+deepsearch-toolkit
 
 # Orquestación de Modelos de Lenguaje (LLM) y Vectores
 langchain==0.1.16

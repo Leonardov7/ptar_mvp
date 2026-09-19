@@ -1,0 +1,2617 @@
+================================================================================
+ARCHIVO: docker-compose.yml
+================================================================================
+
+services:
+  # 1. Servidor de Inferencia Local (Ollama)
+  llm_engine:
+    image: ollama/ollama:latest
+    container_name: ptar_llm_engine
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  # 2. Base de Datos Relacional y Vectorial (PostgreSQL + pgvector)
+  vector_db:
+    image: ankane/pgvector:latest
+    container_name: ptar_vector_db
+    environment:
+      POSTGRES_USER: ptar_admin
+      POSTGRES_PASSWORD: ptar_secure_password
+      POSTGRES_DB: ptar_knowledge_base
+    ports:
+      # Puerto modificado a 5455 para evadir colisiones en tu entorno de desarrollo
+      - "5455:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # 3. Orquestador Backend (FastAPI + IBM Docling + LangChain)
+  backend_api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ptar_backend
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      # Puerto modificado a 8055 para evadir colisiones en tu entorno de desarrollo
+      - "8055:8000"
+    environment:
+      - DATABASE_URL=postgresql://ptar_admin:ptar_secure_password@vector_db:5432/ptar_knowledge_base
+      - OLLAMA_BASE_URL=http://llm_engine:11434
+      - LLM_MODEL_NAME=llama3
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - vector_db
+      - llm_engine
+    restart: unless-stopped
+
+  # 4. Interfaz de Usuario (Vue.js 3 + Nginx)
+  frontend_ui:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ptar_frontend
+    ports:
+      # Puerto 810 asignado según tu directiva
+      - "810:80"
+    depends_on:
+      - backend_api
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  pg_data:
+
+================================================================================
+ARCHIVO: backend\Dockerfile
+================================================================================
+
+FROM python:3.11-slim
+
+# Evitar la creación de archivos .pyc y forzar la salida estándar sin buffer
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Instalar dependencias del sistema necesarias para compilar librerías de ML, PostgreSQL y utilidades
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpq-dev \
+    gcc \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copiar el archivo de requerimientos e instalar dependencias de Python
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copiar el código fuente del backend
+COPY . .
+
+# Exponer el puerto para Uvicorn
+EXPOSE 8000
+
+# Ejecutar el servidor FastAPI
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+================================================================================
+ARCHIVO: backend\main.py
+================================================================================
+
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+
+from app.core.config import engine, Base
+
+try:
+    # Se enruta a la capa de dominio físico (ORM) para la creación de tablas
+    from app.models.domain import * 
+except ImportError:
+    pass
+
+from app.api.endpoints import router as api_router
+from app.api.websocket import router as ws_router
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Iniciando orquestador. Verificando conexión a PostgreSQL...")
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+            conn.commit()
+            logger.info("Extensión pgvector verificada en PostgreSQL.")
+        
+        Base.metadata.create_all(bind=engine)
+        logger.info("Estructura de tablas ORM sincronizada.")
+    except Exception as e:
+        logger.error(f"Error crítico de base de datos en el arranque: {str(e)}")
+    
+    yield 
+    
+    logger.info("Apagando orquestador y liberando recursos.")
+
+app = FastAPI(
+    title="API Híbrida RAG y CBR - PTAR",
+    description="Backend para el sistema de soporte a la decisión basado en casos empíricos y normatividad ambiental.",
+    version="1.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(api_router, prefix="/api/v1")
+app.include_router(ws_router, prefix="/ws/v1")
+
+@app.get("/", tags=["Health Check"])
+async def root():
+    return {
+        "status": "online",
+        "service": "PTAR MVP API",
+        "message": "El orquestador backend está en funcionamiento y el puerto 8000 está abierto."
+    }
+
+================================================================================
+ARCHIVO: backend\requirements.txt
+================================================================================
+
+# Framework Web y Servidor
+fastapi==0.110.1
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+pydantic-settings==2.3.0
+
+# Procesamiento de Documentos Complejos y Toolkit Base
+docling==1.1.0
+deepsearch-toolkit
+
+# Orquestación de Modelos de Lenguaje (LLM) y Vectores
+langchain==0.1.16
+langchain-community==0.0.34
+sentence-transformers==2.7.0
+
+# Base de Datos y ORM
+SQLAlchemy==2.0.29
+psycopg2-binary==2.9.9
+pgvector==0.2.5
+
+# Manejo de Asincronía y WebSockets
+websockets==12.0
+
+# Utilidades de archivos y peticiones HTTP
+python-multipart==0.0.9
+requests==2.32.3
+
+================================================================================
+ARCHIVO: backend\app\__init__.py
+================================================================================
+
+
+
+================================================================================
+ARCHIVO: backend\app\api\endpoints.py
+================================================================================
+
+import os
+import logging
+from fastapi import APIRouter, HTTPException, UploadFile, File
+from pydantic import BaseModel
+from sqlalchemy import text
+from app.core.config import engine
+from app.services.docling_processor import docling_service
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+class EmpiricalCaseCreate(BaseModel):
+    author: str
+    symptoms: str
+    action_taken: str
+    result: str
+
+class EmpiricalCaseResponse(BaseModel):
+    id: int
+    status: str
+    message: str
+
+class ManualUploadResponse(BaseModel):
+    status: str
+    processing_time_seconds: float
+    chunks_created: int
+
+_embedder_instance = None
+
+def get_embedding(text_input: str) -> list:
+    global _embedder_instance
+    if _embedder_instance is None:
+        from sentence_transformers import SentenceTransformer
+        logger.info("Inicializando SentenceTransformer para rutas de la API...")
+        _embedder_instance = SentenceTransformer('all-MiniLM-L6-v2')
+    return _embedder_instance.encode(text_input).tolist()
+
+@router.post("/empirical-case", response_model=EmpiricalCaseResponse)
+async def create_empirical_case(case: EmpiricalCaseCreate):
+    """
+    Ingesta de conocimiento tácito (CBR).
+    Recibe los datos del operario, los vectoriza y los almacena en PostgreSQL.
+    """
+    try:
+        content_to_vectorize = f"Síntomas: {case.symptoms}. Acción: {case.action_taken}. Resultado: {case.result}"
+        vector = get_embedding(content_to_vectorize)
+        vector_str = str(vector)
+
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("""
+                    INSERT INTO knowledge_vectors (author, symptoms, action_taken, result, embedding)
+                    VALUES (:author, :symptoms, :action_taken, :result, :embedding)
+                    RETURNING id;
+                """),
+                {
+                    "author": case.author,
+                    "symptoms": case.symptoms,
+                    "action_taken": case.action_taken,
+                    "result": case.result,
+                    "embedding": vector_str
+                }
+            )
+            inserted_id = result.scalar()
+
+        logger.info(f"Caso empírico insertado exitosamente con ID {inserted_id} por {case.author}")
+        
+        return EmpiricalCaseResponse(
+            id=inserted_id,
+            status="success",
+            message="Caso indexado correctamente en el motor CBR."
+        )
+
+    except Exception as e:
+        logger.error(f"Fallo en la inserción del caso CBR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/upload-manual", response_model=ManualUploadResponse)
+async def upload_manual_endpoint(file: UploadFile = File(...)):
+    """
+    Ingesta normativa (RAG).
+    Procesa archivos PDF usando IBM Docling, genera fragmentos semánticos y los inserta en PostgreSQL.
+    """
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="El archivo debe tener un formato PDF.")
+
+    temp_file_path = f"/tmp/{file.filename}"
+    
+    try:
+        with open(temp_file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+
+        docling_result = await docling_service.process_pdf_to_markdown(temp_file_path)
+        
+        if docling_result["status"] == "error":
+            raise Exception(docling_result["error_message"])
+
+        markdown_text = docling_result["markdown_content"]
+        
+        chunks = [chunk.strip() for chunk in markdown_text.split("\n\n") if len(chunk.strip()) > 50]
+        
+        inserted_chunks = 0
+        with engine.begin() as conn:
+            for chunk in chunks:
+                vector = get_embedding(chunk)
+                conn.execute(
+                    text("""
+                        INSERT INTO document_chunks (content, metadata, embedding)
+                        VALUES (:content, :metadata, :embedding)
+                    """),
+                    {
+                        "content": chunk,
+                        "metadata": file.filename,
+                        "embedding": str(vector)
+                    }
+                )
+                inserted_chunks += 1
+
+        return ManualUploadResponse(
+            status="success",
+            processing_time_seconds=docling_result["processing_time_seconds"],
+            chunks_created=inserted_chunks
+        )
+
+    except Exception as e:
+        logger.error(f"Error procesando manual normativo: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+================================================================================
+ARCHIVO: backend\app\api\websocket.py
+================================================================================
+
+import json
+import logging
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from sqlalchemy import text
+from app.core.config import engine
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+_embedder_instance = None
+
+def get_embedding(text_input: str) -> list:
+    """
+    Transforma el texto de entrada en un vector denso.
+    Se aplica importación diferida absoluta para evitar bloqueos de Uvicorn en el arranque.
+    """
+    global _embedder_instance
+    if _embedder_instance is None:
+        logger.info("Importando librerías pesadas de Machine Learning en tiempo de ejecución...")
+        try:
+            from sentence_transformers import SentenceTransformer
+            logger.info("Inicializando modelo de embeddings en memoria RAM...")
+            _embedder_instance = SentenceTransformer('all-MiniLM-L6-v2')
+        except Exception as e:
+            logger.error(f"Fallo crítico al cargar SentenceTransformer: {str(e)}")
+            return []
+            
+    return _embedder_instance.encode(text_input).tolist()
+
+PROFILES = {
+    "operator": {
+        "temperature": 0.3,
+        "system": (
+            "Eres el Asistente Operativo de la PTAR. Tu rol es guiar al personal de planta. "
+            "Usa lenguaje claro, directo y enfocado en la solución paso a paso. "
+            "Evita análisis teóricos complejos a menos que se requieran estrictamente."
+        )
+    },
+    "engineer": {
+        "temperature": 0.1,
+        "system": (
+            "Eres el Ingeniero Jefe Analítico de la PTAR. Tu rol es el diagnóstico profundo. "
+            "Usa terminología técnica, fisicoquímica y termodinámica rigurosa."
+        )
+    }
+}
+
+@router.websocket("/stream")
+async def websocket_chat_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("Túnel WebSocket TCP establecido con éxito.")
+
+    try:
+        with engine.connect() as db_connection:
+            while True:
+                raw_payload = await websocket.receive_text()
+                
+                try:
+                    data = json.loads(raw_payload)
+                except json.JSONDecodeError:
+                    continue
+
+                user_message = data.get("message", "")
+                profile_key = data.get("profile", "operator")
+                threshold = float(data.get("threshold", 0.85))
+
+                if not user_message:
+                    continue
+
+                query_vector = get_embedding(user_message)
+                if not query_vector:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "content": "El motor de vectorización falló al cargar."
+                    }))
+                    continue
+                    
+                vector_str = str(query_vector)
+
+                cbr_query = text("""
+                    SELECT author, symptoms, action_taken, result,
+                           1 - (embedding <=> :vec) AS similarity
+                    FROM knowledge_vectors
+                    WHERE 1 - (embedding <=> :vec) >= :threshold
+                    ORDER BY similarity DESC
+                    LIMIT 1
+                """)
+
+                cbr_result = db_connection.execute(cbr_query, {"vec": vector_str, "threshold": threshold}).fetchone()
+
+                strategy = ""
+                context_data = ""
+
+                if cbr_result:
+                    strategy = f"Razonamiento Basado en Casos (CBR) - Similitud Semántica: {cbr_result.similarity:.2f}"
+                    context_data = (
+                        f"CASO HISTÓRICO EMPÍRICO:\n"
+                        f"Autor: {cbr_result.author}\n"
+                        f"Síntomas: {cbr_result.symptoms}\n"
+                        f"Acción ejecutada: {cbr_result.action_taken}\n"
+                        f"Resultado final: {cbr_result.result}"
+                    )
+                else:
+                    strategy = "Generación Aumentada (RAG) - Fallback Técnico"
+                    try:
+                        rag_query = text("""
+                            SELECT content, metadata, 
+                                   1 - (embedding <=> :vec) AS similarity
+                            FROM document_chunks
+                            ORDER BY similarity DESC
+                            LIMIT 2
+                        """)
+                        rag_results = db_connection.execute(rag_query, {"vec": vector_str}).fetchall()
+                        
+                        if rag_results:
+                            fragments = [f"Extracto ({row.metadata}):\n{row.content}" for row in rag_results]
+                            context_data = "\n\n".join(fragments)
+                        else:
+                            context_data = "No hay normatividad disponible. Usa conocimiento teórico universal."
+                    except Exception:
+                        context_data = "Sistema documental vacío. Usa conocimiento teórico base."
+
+                await websocket.send_text(json.dumps({
+                    "type": "metadata",
+                    "strategy": strategy,
+                    "content": ""
+                }))
+
+                # Importación diferida de LangChain para aislar la memoria
+                from langchain_community.llms import Ollama
+                from langchain.prompts import PromptTemplate
+
+                profile = PROFILES.get(profile_key, PROFILES["operator"])
+                llm = Ollama(
+                    base_url="http://llm_engine:11434",
+                    model="llama3",
+                    temperature=profile["temperature"]
+                )
+
+                prompt_t = PromptTemplate(
+                    input_variables=["system", "context", "question"],
+                    template="{system}\n\n[CONTEXTO PTAR]\n{context}\n\n[PREGUNTA]\n{question}\n\nRespuesta:"
+                )
+
+                prompt_formatted = prompt_t.format(
+                    system=profile["system"],
+                    context=context_data,
+                    question=user_message
+                )
+
+                for chunk in llm.stream(prompt_formatted):
+                    await websocket.send_text(json.dumps({
+                        "type": "token",
+                        "content": chunk
+                    }))
+
+                await websocket.send_text(json.dumps({
+                    "type": "end",
+                    "content": ""
+                }))
+
+    except WebSocketDisconnect:
+        logger.info("Cliente desconectado de manera limpia.")
+    except Exception as e:
+        logger.error(f"Fallo en enrutamiento lógico: {str(e)}")
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "content": "Fallo interno en el motor lógico."
+            }))
+        except:
+            pass
+        await websocket.close()
+
+================================================================================
+ARCHIVO: backend\app\api\__init__.py
+================================================================================
+
+
+
+================================================================================
+ARCHIVO: backend\app\core\config.py
+================================================================================
+
+import os
+import logging
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
+
+# Configuración del registro de eventos para auditoría
+logger = logging.getLogger(__name__)
+
+# Definición de la cadena de conexión extrayendo las credenciales del entorno Docker
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", 
+    "postgresql://ptar_admin:ptar_secure_password@vector_db:5432/ptar_knowledge_base"
+)
+
+# Inicialización del motor SQLAlchemy y la fábrica de sesiones
+try:
+    engine = create_engine(DATABASE_URL, echo=False)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base = declarative_base()
+    logger.info("Motor de base de datos relacional inicializado correctamente.")
+except Exception as e:
+    logger.error(f"Error crítico al conectar con el contenedor PostgreSQL: {str(e)}")
+    raise e
+
+def get_db():
+    """
+    Generador de dependencias para proveer sesiones de base de datos a los endpoints de FastAPI.
+    Garantiza el cierre seguro de la conexión tras la transacción, previniendo fugas de memoria.
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+================================================================================
+ARCHIVO: backend\app\core\__init__.py
+================================================================================
+
+
+
+================================================================================
+ARCHIVO: backend\app\models\domain.py
+================================================================================
+
+from sqlalchemy import Column, Integer, String, Text
+from pgvector.sqlalchemy import Vector
+from app.core.config import Base
+
+class KnowledgeVector(Base):
+    """
+    Modelo ORM para la Bitácora Empírica (Razonamiento Basado en Casos - CBR).
+    Almacena el conocimiento tácito de los operarios y el vector denso para búsquedas semánticas.
+    """
+    __tablename__ = "knowledge_vectors"
+    __table_args__ = {'extend_existing': True}
+    
+    id = Column(Integer, primary_key=True, index=True)
+    author = Column(String(255), nullable=False)
+    symptoms = Column(Text, nullable=False)
+    action_taken = Column(Text, nullable=False)
+    result = Column(Text, nullable=False)
+    # Dimensiones explícitas requeridas por el motor SentenceTransformer
+    embedding = Column(Vector(384))
+
+class DocumentChunk(Base):
+    """
+    Modelo ORM para la Ingesta Normativa (Generación Aumentada por Recuperación - RAG).
+    Almacena los fragmentos de los manuales procesados por IBM Docling.
+    """
+    __tablename__ = "document_chunks"
+    __table_args__ = {'extend_existing': True}
+    
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(Text, nullable=False)
+    
+    # CORRECCIÓN ARQUITECTÓNICA: Se evade la palabra reservada 'metadata' en el ORM, 
+    # pero se instruye a PostgreSQL a conservar 'metadata' como el nombre real de la columna.
+    doc_metadata = Column("metadata", String(255), nullable=False)
+    
+    # Dimensiones explícitas requeridas por el motor SentenceTransformer
+    embedding = Column(Vector(384))
+
+================================================================================
+ARCHIVO: backend\app\models\schemas.py
+================================================================================
+
+from pydantic import BaseModel, Field
+from typing import Optional, List
+from datetime import datetime
+
+# ==========================================
+# ESQUEMAS PARA LA BITÁCORA EMPÍRICA (CBR)
+# ==========================================
+
+class EmpiricalCaseBase(BaseModel):
+    """
+    Estructura base de un caso operativo reportado por el personal de planta.
+    Captura los síntomas del reactor, la acción ejecutada y el resultado obtenido.
+    """
+    symptoms: str = Field(
+        ..., 
+        description="Descripción del problema, ej: DBO5 alta, lodo flotante, olor séptico."
+    )
+    action_taken: str = Field(
+        ..., 
+        description="Acción heurística realizada, ej: Aumento de purga, cierre de válvulas."
+    )
+    result: str = Field(
+        ..., 
+        description="Resultado de la acción, ej: Estabilización del manto de lodos en 2 horas."
+    )
+    author: str = Field(
+        ..., 
+        description="Nombre o identificador del operario que documenta el caso."
+    )
+
+class EmpiricalCaseCreate(EmpiricalCaseBase):
+    """
+    Esquema utilizado para la creación y recepción de datos desde el Frontend.
+    """
+    pass
+
+class EmpiricalCaseResponse(EmpiricalCaseBase):
+    """
+    Esquema de respuesta tras la vectorización e indexación exitosa del caso.
+    """
+    id: int
+    created_at: datetime
+    source_type: str = "empirical_case"
+
+    class Config:
+        from_attributes = True
+
+# ==========================================
+# ESQUEMAS PARA LAS CONSULTAS (RAG / CBR)
+# ==========================================
+
+class QueryRequest(BaseModel):
+    """
+    Estructura de la consulta enviada por el usuario a través del chat.
+    Incluye el perfil del usuario para el ecualizador de personalidad.
+    """
+    query: str = Field(
+        ..., 
+        description="Pregunta en lenguaje natural sobre un problema operativo o normativo."
+    )
+    user_profile: str = Field(
+        default="operator", 
+        description="Perfil del usuario (ej: 'operator', 'engineer') para ajustar el System Prompt."
+    )
+    similarity_threshold: Optional[float] = Field(
+        default=0.85, 
+        description="Umbral de similitud del coseno para decidir entre CBR y RAG."
+    )
+
+class SourceDocument(BaseModel):
+    """
+    Estructura de los fragmentos de texto recuperados de la base de datos vectorial.
+    """
+    content: str
+    source_type: str # 'empirical_case' o 'theoretical_manual'
+    metadata: dict
+    similarity_score: float
+
+class QueryResponse(BaseModel):
+    """
+    Respuesta final generada por el LLM junto con las fuentes utilizadas.
+    """
+    answer: str = Field(
+        ..., 
+        description="Texto generado por Ollama (Llama 3 / Mistral)."
+    )
+    primary_source_type: str = Field(
+        ..., 
+        description="Indica si la respuesta se basó en la bitácora (CBR) o en los manuales (RAG)."
+    )
+    sources: List[SourceDocument] = Field(
+        default=[], 
+        description="Lista de documentos recuperados que fundamentan la respuesta."
+    )
+
+# ==========================================
+# ESQUEMAS PARA LA INGESTA DE DOCUMENTOS
+# ==========================================
+
+class DocumentUploadResponse(BaseModel):
+    """
+    Respuesta tras procesar un manual de la PTAR con IBM Docling.
+    """
+    filename: str
+    status: str
+    chunks_created: int
+    processing_time_seconds: float
+
+================================================================================
+ARCHIVO: backend\app\models\__init__.py
+================================================================================
+
+from sqlalchemy import Column, Integer, String, Text, DateTime
+from sqlalchemy.sql import func
+from pgvector.sqlalchemy import Vector
+from app.core.config import Base
+
+class KnowledgeVector(Base):
+    """
+    Entidad ORM (Object-Relational Mapping) que representa la base de conocimiento unificada.
+    Almacena tanto la bitácora empírica (CBR) como los manuales teóricos (RAG), diferenciados
+    exclusivamente por la columna 'source_type'.
+    """
+    __tablename__ = "knowledge_vectors"
+
+    id = Column(Integer, primary_key=True, index=True)
+    
+    content = Column(
+        Text, 
+        nullable=False, 
+        doc="Contenido en texto crudo (caso empírico o chunk de docling)"
+    )
+    
+    source_type = Column(
+        String(50), 
+        nullable=False, 
+        index=True, 
+        doc="Filtro estricto: 'empirical_case' o 'theoretical_manual'"
+    )
+    
+    author = Column(
+        String(100), 
+        nullable=True, 
+        doc="Identificador del operario o nombre del archivo origen"
+    )
+    
+    created_at = Column(
+        DateTime(timezone=True), 
+        server_default=func.now(), 
+        doc="Marca de tiempo de la indexación"
+    )
+    
+    # Columna vectorial dimensionada para paraphrase-multilingual-MiniLM-L12-v2
+    embedding = Column(
+        Vector(384), 
+        nullable=False, 
+        doc="Representación matemática del texto en el espacio latente"
+    )
+
+================================================================================
+ARCHIVO: backend\app\services\cbr_router.py
+================================================================================
+
+import logging
+from typing import List, Dict, Any
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sentence_transformers import SentenceTransformer
+from app.models import KnowledgeVector
+
+logger = logging.getLogger(__name__)
+
+class CBRRouter:
+    """
+    Servicio encargado de la vectorización en memoria y el enrutamiento lógico 
+    de las consultas, aplicando el filtrado de metadatos para separar la 
+    experiencia empírica de la literatura normativa.
+    """
+    def __init__(self):
+        logger.info("Inicializando modelo SentenceTransformers (CPU/GPU local)...")
+        # Modelo multilingüe optimizado de 384 dimensiones.
+        self.encoder = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+        self.embedding_dimension = 384
+        logger.info("Modelo de vectorización SentenceTransformers cargado con éxito.")
+
+    def embed_text(self, text: str) -> List[float]:
+        """
+        Transforma el texto en lenguaje natural a un vector denso.
+        """
+        vector = self.encoder.encode(text)
+        return vector.tolist()
+
+    def store_empirical_case(self, db: Session, symptoms: str, action: str, result: str, author: str) -> KnowledgeVector:
+        """
+        Estructura el reporte operativo de la bitácora, lo vectoriza y lo almacena 
+        en la base de datos con el metadato 'empirical_case'.
+        """
+        content = f"SINTOMAS: {symptoms}\nACCION: {action}\nRESULTADO: {result}"
+        vector = self.embed_text(content)
+
+        new_case = KnowledgeVector(
+            content=content,
+            source_type="empirical_case",
+            author=author,
+            embedding=vector
+        )
+        
+        db.add(new_case)
+        db.commit()
+        db.refresh(new_case)
+        logger.info(f"Caso empírico insertado exitosamente con ID {new_case.id} por {author}")
+        return new_case
+
+    def store_theoretical_chunk(self, db: Session, chunk_content: str, filename: str) -> KnowledgeVector:
+        """
+        Vectoriza y almacena un fragmento de Markdown procesado por IBM Docling 
+        con el metadato 'theoretical_manual'.
+        """
+        vector = self.embed_text(chunk_content)
+
+        new_chunk = KnowledgeVector(
+            content=chunk_content,
+            source_type="theoretical_manual",
+            author=filename,
+            embedding=vector
+        )
+        
+        db.add(new_chunk)
+        db.commit()
+        db.refresh(new_chunk)
+        logger.info(f"Fragmento normativo insertado exitosamente con ID {new_chunk.id} (Origen: {filename})")
+        return new_chunk
+
+    def route_and_search(self, db: Session, query: str, similarity_threshold: float = 0.85) -> Dict[str, Any]:
+        """
+        Ejecuta la búsqueda de similitud secuencial. 
+        Calcula la distancia del coseno utilizando la extensión pgvector en PostgreSQL.
+        """
+        query_vector = self.embed_text(query)
+        distance_threshold = 1.0 - similarity_threshold
+
+        # Paso A: Búsqueda estricta en Bitácora Empírica (CBR)
+        empirical_query = select(
+            KnowledgeVector, 
+            KnowledgeVector.embedding.cosine_distance(query_vector).label("distance")
+        ).where(KnowledgeVector.source_type == "empirical_case").order_by("distance").limit(3)
+        
+        empirical_results = db.execute(empirical_query).all()
+        
+        valid_empirical = [row for row in empirical_results if row.distance <= distance_threshold]
+        
+        if valid_empirical:
+            logger.info("Caso empírico detectado. Enrutando hacia estrategia CBR.")
+            return {
+                "routing_strategy": "CBR",
+                "documents": [
+                    {
+                        "content": row.KnowledgeVector.content, 
+                        "author": row.KnowledgeVector.author, 
+                        "similarity": round(1.0 - row.distance, 4)
+                    } for row in valid_empirical
+                ]
+            }
+        
+        # Paso B: Fallback a Manuales Normativos (RAG) si no hay casos empíricos similares
+        logger.info("Sin casos empíricos suficientes. Ejecutando fallback teórico RAG.")
+        theoretical_query = select(
+            KnowledgeVector, 
+            KnowledgeVector.embedding.cosine_distance(query_vector).label("distance")
+        ).where(KnowledgeVector.source_type == "theoretical_manual").order_by("distance").limit(3)
+            
+        theoretical_results = db.execute(theoretical_query).all()
+        
+        # Para la literatura teórica somos más permisivos con el umbral (ej. ampliamos la tolerancia de distancia)
+        valid_theoretical = [row for row in theoretical_results if row.distance <= (distance_threshold + 0.15)]
+
+        return {
+            "routing_strategy": "RAG",
+            "documents": [
+                {
+                    "content": row.KnowledgeVector.content, 
+                    "author": row.KnowledgeVector.author, 
+                    "similarity": round(1.0 - row.distance, 4)
+                } for row in valid_theoretical
+            ]
+        }
+
+# Instancia global del enrutador
+cbr_service = CBRRouter()
+
+================================================================================
+ARCHIVO: backend\app\services\docling_processor.py
+================================================================================
+
+import os
+import time
+import logging
+from typing import Optional, Dict, Any
+from pathlib import Path
+
+# Las importaciones globales de IBM Docling han sido retiradas de la cabecera 
+# para aislar el hilo principal de Uvicorn y aplicar inicialización diferida (Lazy Loading).
+
+logger = logging.getLogger(__name__)
+
+class DoclingProcessor:
+    """
+    Servicio encargado de ingerir documentos técnicos en formato PDF (manuales O&M, normativas)
+    y decodificarlos estructuralmente a formato Markdown utilizando IBM Docling, 
+    preservando la integridad de las tablas fisicoquímicas y la jerarquía de títulos.
+    """
+
+    def __init__(self):
+        # Inicialización en nulo del convertidor de documentos para proteger el servidor
+        self.converter = None
+
+    def _get_converter(self):
+        """
+        Importa e instancia el motor de conversión únicamente cuando se recibe el primer documento.
+        Evade dependencias obsoletas como 'InputFormat' ajustándose a la API moderna de Docling.
+        """
+        if self.converter is None:
+            logger.info("Importando motor IBM Docling y modelos en tiempo de ejecución...")
+            try:
+                from docling.document_converter import DocumentConverter
+                from docling.datamodel.pipeline_options import PdfPipelineOptions
+                
+                # Configuración de las opciones del pipeline para PDFs
+                pipeline_options = PdfPipelineOptions()
+                pipeline_options.do_table_structure = True
+                pipeline_options.do_ocr = True
+                
+                # Inicialización del convertidor de documentos (soporta PDF de forma nativa)
+                # Se omite allowed_formats=[InputFormat.PDF] para prevenir el ImportError de rutas obsoletas.
+                self.converter = DocumentConverter()
+                
+                logger.info("IBM Docling DocumentConverter inicializado correctamente.")
+            except Exception as e:
+                logger.error(f"Error crítico al inicializar Docling: {str(e)}")
+                raise e
+        return self.converter
+
+    async def process_pdf_to_markdown(self, file_path: str) -> Dict[str, Any]:
+        """
+        Procesa un archivo PDF almacenado localmente y retorna su representación en Markdown.
+        
+        Args:
+            file_path (str): Ruta absoluta o relativa al archivo PDF.
+            
+        Returns:
+            Dict[str, Any]: Diccionario con el contenido estructurado y metadatos del procesamiento.
+        """
+        start_time = time.time()
+        
+        if not os.path.exists(file_path):
+            logger.error(f"El archivo {file_path} no fue encontrado en el sistema de archivos.")
+            raise FileNotFoundError(f"Archivo no encontrado: {file_path}")
+
+        logger.info(f"Iniciando decodificación estructural del documento: {file_path}")
+
+        try:
+            # Invoca el método de importación diferida en tiempo real
+            converter = self._get_converter()
+            
+            # La conversión en Docling puede ser un proceso bloqueante pesado.
+            # En un entorno de producción estricto con FastAPI, esto podría envolverse en run_in_threadpool
+            conversion_result = converter.convert(file_path)
+            
+            # Exportar el documento decodificado a formato Markdown
+            markdown_content = conversion_result.document.export_to_markdown()
+            
+            end_time = time.time()
+            processing_time = round(end_time - start_time, 2)
+            
+            logger.info(f"Documento procesado exitosamente en {processing_time} segundos.")
+            
+            return {
+                "status": "success",
+                "filename": Path(file_path).name,
+                "markdown_content": markdown_content,
+                "processing_time_seconds": processing_time,
+                "metadata": {
+                    "source_type": "theoretical_manual",
+                    "original_format": "application/pdf",
+                    "conversion_engine": "ibm_docling"
+                }
+            }
+
+        except Exception as e:
+            end_time = time.time()
+            logger.error(f"Fallo durante la conversión del documento {file_path}. Error: {str(e)}")
+            return {
+                "status": "error",
+                "filename": Path(file_path).name,
+                "error_message": str(e),
+                "processing_time_seconds": round(end_time - start_time, 2)
+            }
+
+    def save_markdown_to_disk(self, markdown_content: str, output_path: str) -> bool:
+        """
+        Utilidad para guardar el Markdown generado en el disco duro, útil para
+        auditoría manual antes de pasarlo al Chunking.
+        
+        Args:
+            markdown_content (str): El texto estructurado en Markdown.
+            output_path (str): Ruta de destino para el archivo .md
+            
+        Returns:
+            bool: True si se guardó correctamente, False en caso contrario.
+        """
+        try:
+            with open(output_path, "w", encoding="utf-8") as file:
+                file.write(markdown_content)
+            logger.info(f"Archivo Markdown exportado exitosamente en: {output_path}")
+            return True
+        except IOError as e:
+            logger.error(f"Error de E/S al escribir el archivo Markdown en {output_path}: {str(e)}")
+            return False
+
+# Instancia global del procesador para ser importada por los controladores (Singleton pattern)
+docling_service = DoclingProcessor()
+
+================================================================================
+ARCHIVO: backend\app\services\rag_engine.py
+================================================================================
+
+import os
+import json
+import logging
+import requests
+from typing import List, Dict, Any, Generator
+
+logger = logging.getLogger(__name__)
+
+class RAGEngine:
+    """
+    Motor de Inferencia LLM.
+    Orquesta la comunicación con el contenedor de Ollama, inyecta el contexto recuperado 
+    (RAG Teórico o CBR Empírico) y aplica el Ecualizador de Personalidad mediante System Prompts.
+    """
+    def __init__(self):
+        # Captura las credenciales de red definidas en el docker-compose.yml
+        self.ollama_url = os.getenv("OLLAMA_BASE_URL", "http://llm_engine:11434")
+        self.model_name = os.getenv("LLM_MODEL_NAME", "llama3")
+        self.api_endpoint = f"{self.ollama_url}/api/chat"
+        logger.info(f"RAG Engine inicializado. Conectando al modelo {self.model_name} en {self.ollama_url}")
+
+    def _build_context_string(self, documents: List[Dict[str, Any]]) -> str:
+        """
+        Formatea los documentos recuperados de PostgreSQL/pgvector en una cadena 
+        estructurada para ser inyectada en la ventana de atención del LLM.
+        """
+        context = ""
+        for idx, doc in enumerate(documents, 1):
+            similarity = doc.get('similarity', 0)
+            author = doc.get('author', 'Desconocido')
+            context += f"\n--- DOCUMENTO {idx} (Origen: {author} | Similitud: {similarity}) ---\n"
+            context += f"{doc.get('content', '')}\n"
+        return context
+
+    def _get_system_prompt(self, routing_strategy: str, user_profile: str, context: str) -> str:
+        """
+        ECUALIZADOR DE PERSONALIDAD:
+        Ajusta el tono, la terminología y las instrucciones base del LLM dependiendo 
+        de la fuente (empírica vs teórica) y del rol del usuario (operario vs ingeniero).
+        """
+        base_prompt = ""
+        
+        # 1. Definición del Tono Lingüístico (Perfil de Usuario)
+        if user_profile == "engineer":
+            base_prompt += "Eres un Ingeniero Ambiental y Jefe de Planta de Tratamiento. Hablas con rigor técnico, "
+            base_prompt += "utilizas nomenclatura científica estricta (cinética de reactores, parámetros fisicoquímicos) "
+            base_prompt += "y justificas tus decisiones con base en procesos biológicos y ecuaciones de estado.\n\n"
+        else:
+            base_prompt += "Eres un Supervisor Operativo de PTAR experimentado. Eres directo, claro y pragmático. "
+            base_prompt += "Proporcionas instrucciones paso a paso, priorizas la seguridad industrial e integridad del equipo, "
+            base_prompt += "y evitas jerga científica innecesaria. Tu objetivo es estabilizar el reactor rápidamente.\n\n"
+
+        # 2. Definición de la Restricción de Conocimiento (Estrategia CBR vs RAG)
+        if routing_strategy == "CBR":
+            base_prompt += "RESTRICCIÓN CRÍTICA: La información que tienes a continuación proviene de la BITÁCORA EMPÍRICA "
+            base_prompt += "de otros operarios de la planta. No es teoría estándar, es experiencia local probada.\n"
+            base_prompt += "Basado EXCLUSIVAMENTE en estos casos empíricos resueltos, dile al usuario cómo solucionar el problema.\n"
+            base_prompt += "Inicia tu respuesta aclarando explícitamente que esta directriz se basa en la experiencia histórica del personal de la planta.\n\n"
+        else:
+            base_prompt += "RESTRICCIÓN CRÍTICA: No existen registros empíricos locales para esta falla. La información a continuación "
+            base_prompt += "proviene de los MANUALES DE OPERACIÓN TÉCNICA y la NORMATIVA AMBIENTAL VIGENTE.\n"
+            base_prompt += "Basado EXCLUSIVAMENTE en la literatura recuperada, elabora una solución técnica para el problema.\n"
+            base_prompt += "Si la solución no puede deducirse del texto provisto, indica que requieres inspección presencial y no alucines respuestas.\n\n"
+            
+        base_prompt += f"CONTEXTO RECUPERADO DE LA BASE DE DATOS VECTORIAL:\n{context}\n\n"
+        base_prompt += "INSTRUCCIÓN FINAL: Responde únicamente a la pregunta del usuario utilizando el contexto anterior, respetando tu rol asignado."
+        
+        return base_prompt
+
+    def generate_response(self, query: str, routing_strategy: str, documents: List[Dict[str, Any]], user_profile: str = "operator") -> Dict[str, Any]:
+        """
+        Genera una inferencia completa de una sola vez (síncrona).
+        """
+        context_str = self._build_context_string(documents)
+        system_prompt = self._get_system_prompt(routing_strategy, user_profile, context_str)
+        
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query}
+            ],
+            "stream": False,
+            "options": {
+                # Reducimos la temperatura para el ingeniero (mayor precisión matemática) 
+                # y la aumentamos levemente para el operario (mayor adaptabilidad lingüística).
+                "temperature": 0.1 if user_profile == "engineer" else 0.3
+            }
+        }
+        
+        try:
+            response = requests.post(self.api_endpoint, json=payload, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            
+            return {
+                "answer": data.get("message", {}).get("content", ""),
+                "primary_source_type": routing_strategy,
+                "sources": documents
+            }
+        except Exception as e:
+            logger.error(f"Error de red en la inferencia LLM con Ollama: {str(e)}")
+            raise e
+
+    def stream_response(self, query: str, routing_strategy: str, documents: List[Dict[str, Any]], user_profile: str = "operator") -> Generator[str, None, None]:
+        """
+        Generador asíncrono que consume el endpoint de Ollama manteniendo el socket TCP abierto.
+        Lee los tokens a medida que se generan y los despacha al frontend, mitigando el TTFT (Time To First Token).
+        """
+        context_str = self._build_context_string(documents)
+        system_prompt = self._get_system_prompt(routing_strategy, user_profile, context_str)
+        
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query}
+            ],
+            "stream": True,
+            "options": {
+                "temperature": 0.1 if user_profile == "engineer" else 0.3
+            }
+        }
+        
+        try:
+            # La petición HTTP se hace con stream=True
+            response = requests.post(self.api_endpoint, json=payload, stream=True)
+            response.raise_for_status()
+            
+            for line in response.iter_lines():
+                if line:
+                    chunk = json.loads(line)
+                    if "message" in chunk and "content" in chunk["message"]:
+                        yield chunk["message"]["content"]
+        except Exception as e:
+            logger.error(f"Interrupción en el streaming LLM: {str(e)}")
+            yield f"\n[Fallo crítico de conexión con el motor cognitivo: {str(e)}]"
+
+# Singleton global del servicio
+rag_service = RAGEngine()
+
+================================================================================
+ARCHIVO: backend\app\services\__init__.py
+================================================================================
+
+
+
+================================================================================
+ARCHIVO: frontend\Dockerfile
+================================================================================
+
+# Etapa 1: Construcción
+FROM node:20-alpine as build-stage
+
+WORKDIR /app
+
+# Copiar configuración de dependencias
+COPY package*.json ./
+
+# Instalar dependencias
+RUN npm install
+
+# Copiar código fuente
+COPY . .
+
+# Compilar la aplicación para producción
+RUN npm run build
+
+# Etapa 2: Servidor de Producción
+FROM nginx:stable-alpine as production-stage
+
+# Copiar los archivos compilados de Vue al directorio de Nginx
+COPY --from=build-stage /app/dist /usr/share/nginx/html
+
+# Copiar configuración personalizada de Nginx (opcional, para manejar el enrutamiento SPA)
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]
+
+================================================================================
+ARCHIVO: frontend\index.html
+================================================================================
+
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PTAR - Sistema Híbrido RAG/CBR</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        background-color: #f4f7f6;
+        color: #333;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
+
+================================================================================
+ARCHIVO: frontend\nginx.conf
+================================================================================
+
+server {
+    listen       80;
+    server_name  localhost;
+
+    location / {
+        root   /usr/share/nginx/html;
+        index  index.html index.htm;
+        try_files $uri $uri/ /index.html;
+    }
+
+    error_page   500 502 503 504  /50x.html;
+    location = /50x.html {
+        root   /usr/share/nginx/html;
+    }
+}
+
+================================================================================
+ARCHIVO: frontend\package.json
+================================================================================
+
+{
+  "name": "ptar-mvp-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.4.21",
+    "axios": "^1.6.8"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.4",
+    "vite": "^5.2.8"
+  }
+}
+
+================================================================================
+ARCHIVO: frontend\vite.config.js
+================================================================================
+
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+import path from 'path'
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  plugins: [vue()],
+  server: {
+    host: '0.0.0.0',
+    port: 8080,
+    watch: {
+      usePolling: true
+    }
+  },
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  }
+})
+
+================================================================================
+ARCHIVO: frontend\src\App.vue
+================================================================================
+
+<template>
+  <div class="app-layout">
+    <header class="top-nav">
+      <h1>Sistema Inteligente de Gestión del Conocimiento PTAR</h1>
+      <span class="version">Arquitectura Híbrida CBR/RAG v1.0</span>
+    </header>
+
+    <main class="main-content">
+      <!-- Columna Izquierda: Panel de Control y Captura de Datos -->
+      <aside class="control-panel">
+        <Equalizer @update-settings="handleSettingsUpdate" />
+        <Dropzone />
+        <CaseForm />
+      </aside>
+
+      <!-- Columna Derecha: Interfaz de Interacción Continua -->
+      <section class="inference-panel">
+        <ChatInterface :equalizerSettings="currentSettings" />
+      </section>
+    </main>
+    <footer class="app-footer">
+      developed by Leonardo Valderrama and Gemini version 1.0.0
+    </footer>
+  </div>
+</template>
+
+<script setup>
+import { ref } from 'vue';
+import Equalizer from './components/Equalizer.vue';
+import Dropzone from './components/Dropzone.vue';
+import CaseForm from './components/CaseForm.vue';
+import ChatInterface from './components/ChatInterface.vue';
+
+// Estado global para las configuraciones del ecualizador
+const currentSettings = ref({
+  userProfile: 'operator',
+  similarityThreshold: 0.85
+});
+
+// Receptor del evento emitido por Equalizer.vue
+const handleSettingsUpdate = (newSettings) => {
+  currentSettings.value = newSettings;
+};
+</script>
+
+<style>
+/* Estilos globales y reset aplicados al contenedor principal */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+#app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background-color: #ecf0f1;
+}
+
+.top-nav {
+  background-color: #1a252f;
+  color: #ecf0f1;
+  padding: 15px 30px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  z-index: 10;
+}
+
+.top-nav h1 {
+  margin: 0;
+  font-size: 1.4rem;
+  letter-spacing: 0.5px;
+}
+
+.version {
+  font-size: 0.85rem;
+  opacity: 0.7;
+  font-family: monospace;
+}
+
+.main-content {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  padding: 20px;
+  gap: 20px;
+}
+
+.control-panel {
+  width: 450px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  overflow-y: auto;
+  /* Ocultar barra de desplazamiento para estética limpia */
+  scrollbar-width: thin;
+}
+
+.control-panel::-webkit-scrollbar {
+  width: 6px;
+}
+.control-panel::-webkit-scrollbar-thumb {
+  background-color: #bdc3c7;
+  border-radius: 4px;
+}
+
+.inference-panel {
+  flex: 1;
+  min-width: 0;
+}
+.app-footer {
+  text-align: right;
+  padding: 8px 20px;
+  background-color: #ecf0f1;
+  color: #7f8c8d;
+  font-size: 0.75rem;
+  font-family: monospace;
+  border-top: 1px solid #bdc3c7;
+}
+</style>
+
+================================================================================
+ARCHIVO: frontend\src\main.js
+================================================================================
+
+import { createApp } from 'vue'
+import App from './App.vue'
+
+const app = createApp(App)
+app.mount('#app')
+
+================================================================================
+ARCHIVO: frontend\src\components\CaseForm.vue
+================================================================================
+
+<template>
+  <div class="case-form-wrapper">
+    <!-- Botón disparador en el panel lateral -->
+    <div class="trigger-container">
+      <div class="component-header">
+        <h3>Razonamiento Basado en Casos</h3>
+        <p>Almacenamiento de experiencia tácita operativa.</p>
+      </div>
+      <button class="btn-open-modal" @click="isModalOpen = true">
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"></line>
+          <line x1="5" y1="12" x2="19" y2="12"></line>
+        </svg>
+        Registrar Nueva Bitácora Empírica
+      </button>
+    </div>
+
+    <!-- Modal Overlay -->
+    <div v-if="isModalOpen" class="modal-overlay" @click.self="closeModal">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2>Registro de Bitácora Empírica</h2>
+          <button class="btn-close" @click="closeModal">&times;</button>
+        </div>
+        
+        <p class="modal-description">Documente las intervenciones operativas para alimentar el Razonamiento Basado en Casos (CBR).</p>
+
+        <form @submit.prevent="submitCase" class="cbr-form">
+          <div class="form-group">
+            <label for="author">Identificador del Operario:</label>
+            <input 
+              type="text" 
+              id="author" 
+              v-model="formData.author" 
+              placeholder="Ej: Ing. Juan Pérez / Turno Noche" 
+              required 
+              :disabled="isSubmitting"
+            />
+          </div>
+
+          <div class="form-group">
+            <label for="symptoms">Síntomas del Sistema (Vector de Estado):</label>
+            <textarea 
+              id="symptoms" 
+              v-model="formData.symptoms" 
+              rows="3" 
+              placeholder="Describa la falla detalladamente (Ej: Aumento de turbidez, DBO5 elevada)." 
+              required
+              :disabled="isSubmitting"
+            ></textarea>
+          </div>
+
+          <div class="form-group">
+            <label for="action">Acción Heurística Ejecutada:</label>
+            <textarea 
+              id="action" 
+              v-model="formData.action_taken" 
+              rows="3" 
+              placeholder="¿Qué acciones empíricas realizó? (Ej: Cierre de purga por 2 horas)." 
+              required
+              :disabled="isSubmitting"
+            ></textarea>
+          </div>
+
+          <div class="form-group">
+            <label for="result">Resultado Operativo:</label>
+            <textarea 
+              id="result" 
+              v-model="formData.result" 
+              rows="2" 
+              placeholder="Describa el estado final del reactor tras la acción." 
+              required
+              :disabled="isSubmitting"
+            ></textarea>
+          </div>
+
+          <div class="form-actions">
+            <button type="button" class="btn-cancel" @click="closeModal" :disabled="isSubmitting">Cancelar</button>
+            <button type="submit" class="btn-submit" :disabled="isSubmitting">
+              <span v-if="!isSubmitting">Indexar Caso Vectorial</span>
+              <span v-else>Vectorizando...</span>
+            </button>
+          </div>
+
+          <div v-if="notification.message" :class="['notification', notification.type]">
+            {{ notification.message }}
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, reactive } from 'vue';
+import api from '../services/api.js';
+
+const isModalOpen = ref(false);
+
+const formData = reactive({
+  author: '',
+  symptoms: '',
+  action_taken: '',
+  result: ''
+});
+
+const isSubmitting = ref(false);
+const notification = reactive({
+  message: '',
+  type: ''
+});
+
+const closeModal = () => {
+  if (!isSubmitting.value) {
+    isModalOpen.value = false;
+    notification.message = '';
+  }
+};
+
+const submitCase = async () => {
+  isSubmitting.value = true;
+  notification.message = '';
+  
+  try {
+    const response = await api.submitEmpiricalCase({
+      author: formData.author,
+      symptoms: formData.symptoms,
+      action_taken: formData.action_taken,
+      result: formData.result
+    });
+    
+    notification.type = 'success';
+    notification.message = `Caso empírico indexado exitosamente (ID: ${response.id}).`;
+    
+    formData.symptoms = '';
+    formData.action_taken = '';
+    formData.result = '';
+    
+    setTimeout(() => {
+      closeModal();
+    }, 2000);
+    
+  } catch (error) {
+    notification.type = 'error';
+    const serverDetail = error.response?.data?.detail || error.message;
+    notification.message = `Fallo crítico de indexación: ${serverDetail}`;
+  } finally {
+    isSubmitting.value = false;
+  }
+};
+</script>
+
+<style scoped>
+.trigger-container {
+  background-color: #ffffff;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  padding: 20px;
+  margin-bottom: 20px;
+  border-left: 4px solid #2ecc71;
+}
+
+.component-header h3 {
+  margin-top: 0;
+  margin-bottom: 5px;
+  color: #2c3e50;
+  font-size: 1.1rem;
+}
+
+.component-header p {
+  color: #7f8c8d;
+  font-size: 0.85rem;
+  margin-bottom: 15px;
+  margin-top: 0;
+}
+
+.btn-open-modal {
+  width: 100%;
+  background-color: #2ecc71;
+  color: white;
+  border: none;
+  padding: 12px;
+  font-size: 1rem;
+  font-weight: bold;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  transition: background-color 0.2s;
+}
+
+.btn-open-modal:hover {
+  background-color: #27ae60;
+}
+
+/* Estilos del Modal */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background-color: rgba(0, 0, 0, 0.6);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+.modal-content {
+  background-color: white;
+  padding: 30px;
+  border-radius: 12px;
+  width: 90%;
+  max-width: 600px;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 2px solid #2ecc71;
+  padding-bottom: 10px;
+  margin-bottom: 10px;
+}
+
+.modal-header h2 {
+  margin: 0;
+  color: #2c3e50;
+  font-size: 1.4rem;
+}
+
+.btn-close {
+  background: none;
+  border: none;
+  font-size: 1.8rem;
+  color: #7f8c8d;
+  cursor: pointer;
+}
+
+.btn-close:hover {
+  color: #e74c3c;
+}
+
+.modal-description {
+  color: #7f8c8d;
+  font-size: 0.9rem;
+  margin-bottom: 20px;
+}
+
+.form-group {
+  margin-bottom: 15px;
+}
+
+label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 5px;
+  color: #34495e;
+}
+
+input[type="text"],
+textarea {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #bdc3c7;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.95rem;
+  box-sizing: border-box;
+}
+
+input[type="text"]:focus,
+textarea:focus {
+  outline: none;
+  border-color: #2ecc71;
+  box-shadow: 0 0 0 2px rgba(46, 204, 113, 0.2);
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 15px;
+  margin-top: 25px;
+}
+
+.btn-submit {
+  background-color: #2980b9;
+  color: white;
+  border: none;
+  padding: 10px 20px;
+  font-weight: bold;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.btn-submit:disabled {
+  background-color: #95a5a6;
+  cursor: wait;
+}
+
+.btn-cancel {
+  background-color: white;
+  color: #7f8c8d;
+  border: 1px solid #bdc3c7;
+  padding: 10px 20px;
+  font-weight: bold;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.notification {
+  margin-top: 15px;
+  padding: 10px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.notification.success {
+  background-color: #d4edda;
+  color: #155724;
+  border: 1px solid #c3e6cb;
+}
+
+.notification.error {
+  background-color: #f8d7da;
+  color: #721c24;
+  border: 1px solid #f5c6cb;
+}
+</style>
+
+================================================================================
+ARCHIVO: frontend\src\components\ChatInterface.vue
+================================================================================
+
+<template>
+  <div class="chat-container">
+    <div class="chat-header">
+      <h2>Terminal de Decisión Operativa</h2>
+      <div :class="['status-indicator', connectionStatus]">
+        {{ connectionStatusText }}
+      </div>
+    </div>
+
+    <div class="chat-messages" ref="messagesContainer">
+      <div v-for="(msg, index) in messages" :key="index" :class="['message', msg.role]">
+        <div class="message-content">
+          <div class="message-author">{{ msg.role === 'user' ? 'Operario' : 'Agente Cognitivo PTAR' }}</div>
+          <p class="text-body">{{ msg.content }}</p>
+          
+          <div v-if="msg.role === 'assistant' && msg.metadata" class="metadata-box">
+            <span class="strategy-badge" :class="msg.metadata.routing_strategy">
+              Estrategia Aplicada: {{ msg.metadata.routing_strategy }}
+            </span>
+            <details v-if="msg.metadata.sources && msg.metadata.sources.length > 0">
+              <summary>Fuentes Recuperadas ({{ msg.metadata.sources.length }})</summary>
+              <ul class="sources-list">
+                <li v-for="(source, idx) in msg.metadata.sources" :key="idx">
+                  <strong>Origen:</strong> {{ source.author }} <br>
+                  <strong>Similitud:</strong> {{(source.similarity * 100).toFixed(2)}}%
+                </li>
+              </ul>
+            </details>
+          </div>
+        </div>
+      </div>
+      <div v-if="isTyping" class="message assistant typing-indicator">
+        Generando respuesta del modelo local...
+      </div>
+    </div>
+
+    <div class="chat-input-area">
+      <textarea 
+        v-model="currentInput" 
+        @keydown.enter.prevent="sendMessage"
+        placeholder="Describa el problema operativo (ej. El lodo en el sedimentador primario presenta burbujas)..."
+        :disabled="connectionStatus !== 'connected' || isTyping"
+        rows="3"
+      ></textarea>
+      <button 
+        @click="sendMessage" 
+        :disabled="!currentInput.trim() || connectionStatus !== 'connected' || isTyping"
+        class="btn-send"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, onBeforeUnmount, nextTick, watch } from 'vue';
+
+const props = defineProps({
+  equalizerSettings: {
+    type: Object,
+    required: true
+  }
+});
+
+const messages = ref([]);
+const currentInput = ref('');
+const connectionStatus = ref('disconnected'); // 'disconnected', 'connected', 'error'
+const connectionStatusText = ref('Desconectado');
+const isTyping = ref(false);
+const messagesContainer = ref(null);
+
+let socket = null;
+let currentAssistantMessageIndex = -1;
+
+const connectWebSocket = () => {
+  connectionStatus.value = 'connecting';
+  connectionStatusText.value = 'Conectando al Motor Local...';
+  
+  // CORRECCIÓN ESTRUCTURAL: Se apunta al nuevo puerto 8055 del backend
+  socket = new WebSocket('ws://localhost:8055/ws/v1/stream');
+
+  socket.onopen = () => {
+    connectionStatus.value = 'connected';
+    connectionStatusText.value = 'Conexión Segura Establecida';
+  };
+
+  socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+
+    if (data.error) {
+      messages.value.push({ role: 'assistant', content: `[Error del Servidor]: ${data.error}` });
+      isTyping.value = false;
+      scrollToBottom();
+      return;
+    }
+
+    if (data.type === 'metadata') {
+      // Inicia un nuevo mensaje del asistente con la metadata del CBR/RAG
+      messages.value.push({
+        role: 'assistant',
+        content: '',
+        metadata: {
+          routing_strategy: data.routing_strategy,
+          sources: data.sources_used
+        }
+      });
+      currentAssistantMessageIndex = messages.value.length - 1;
+      isTyping.value = false; // Ya empezamos a recibir texto real
+    } 
+    else if (data.type === 'token') {
+      if (currentAssistantMessageIndex !== -1) {
+        messages.value[currentAssistantMessageIndex].content += data.content;
+      }
+    } 
+    else if (data.type === 'end_of_stream') {
+      currentAssistantMessageIndex = -1;
+      scrollToBottom();
+    }
+  };
+
+  socket.onclose = () => {
+    connectionStatus.value = 'disconnected';
+    connectionStatusText.value = 'Conexión Perdida. Reconectando...';
+    setTimeout(connectWebSocket, 5000); // Intento de reconexión
+  };
+
+  socket.onerror = (error) => {
+    connectionStatus.value = 'error';
+    connectionStatusText.value = 'Fallo de Red';
+    console.error('WebSocket Error:', error);
+  };
+};
+
+const sendMessage = () => {
+  if (!currentInput.value.trim() || connectionStatus.value !== 'connected') return;
+
+  const query = currentInput.value.trim();
+  
+  messages.value.push({ role: 'user', content: query });
+  currentInput.value = '';
+  isTyping.value = true;
+  scrollToBottom();
+
+  const payload = {
+    query: query,
+    user_profile: props.equalizerSettings.userProfile,
+    similarity_threshold: props.equalizerSettings.similarityThreshold
+  };
+
+  socket.send(JSON.stringify(payload));
+};
+
+const scrollToBottom = async () => {
+  await nextTick();
+  if (messagesContainer.value) {
+    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
+  }
+};
+
+// Auto-scroll durante el stream de tokens
+watch(messages, () => {
+  if (currentAssistantMessageIndex !== -1) {
+    scrollToBottom();
+  }
+}, { deep: true });
+
+onMounted(() => {
+  connectWebSocket();
+});
+
+onBeforeUnmount(() => {
+  if (socket) {
+    socket.close();
+  }
+});
+</script>
+
+<style scoped>
+.chat-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background-color: #ffffff;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  overflow: hidden;
+}
+
+.chat-header {
+  padding: 16px 20px;
+  background-color: #2c3e50;
+  color: white;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.chat-header h2 {
+  margin: 0;
+  font-size: 1.2rem;
+}
+
+.status-indicator {
+  font-size: 0.8rem;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-weight: 600;
+}
+
+.status-indicator.connected { background-color: #27ae60; color: white; }
+.status-indicator.disconnected { background-color: #f39c12; color: white; }
+.status-indicator.error { background-color: #e74c3c; color: white; }
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  background-color: #f9fbfd;
+}
+
+.message {
+  margin-bottom: 20px;
+  display: flex;
+}
+
+.message.user {
+  justify-content: flex-end;
+}
+
+.message.assistant {
+  justify-content: flex-start;
+}
+
+.message-content {
+  max-width: 80%;
+  padding: 12px 16px;
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+}
+
+.message.user .message-content {
+  background-color: #3498db;
+  color: white;
+  border-bottom-right-radius: 0;
+}
+
+.message.assistant .message-content {
+  background-color: #ffffff;
+  color: #333;
+  border: 1px solid #e0e6ed;
+  border-bottom-left-radius: 0;
+}
+
+.message-author {
+  font-size: 0.75rem;
+  font-weight: 700;
+  margin-bottom: 5px;
+  text-transform: uppercase;
+  opacity: 0.8;
+}
+
+.text-body {
+  margin: 0;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.typing-indicator {
+  font-style: italic;
+  color: #7f8c8d;
+  font-size: 0.9rem;
+}
+
+.metadata-box {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed #bdc3c7;
+}
+
+.strategy-badge {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: bold;
+  margin-bottom: 8px;
+}
+
+.strategy-badge.CBR { background-color: #8e44ad; color: white; }
+.strategy-badge.RAG { background-color: #2980b9; color: white; }
+
+details summary {
+  font-size: 0.85rem;
+  color: #34495e;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.sources-list {
+  margin-top: 8px;
+  padding-left: 20px;
+  font-size: 0.8rem;
+  color: #7f8c8d;
+}
+
+.sources-list li {
+  margin-bottom: 4px;
+}
+
+.chat-input-area {
+  padding: 15px;
+  background-color: #ffffff;
+  border-top: 1px solid #e0e6ed;
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+textarea {
+  flex: 1;
+  padding: 12px;
+  border: 1px solid #bdc3c7;
+  border-radius: 8px;
+  resize: none;
+  font-family: inherit;
+  font-size: 1rem;
+}
+
+textarea:focus {
+  outline: none;
+  border-color: #3498db;
+}
+
+.btn-send {
+  background-color: #2ecc71;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.2s;
+}
+
+.btn-send:hover:not(:disabled) {
+  background-color: #27ae60;
+}
+
+.btn-send:disabled {
+  background-color: #95a5a6;
+  cursor: not-allowed;
+}
+</style>
+
+================================================================================
+ARCHIVO: frontend\src\components\Dropzone.vue
+================================================================================
+
+<template>
+  <div class="dropzone-container">
+    <div class="component-header">
+      <h3>Ingesta Normativa (RAG)</h3>
+      <p>Vectorización de manuales técnicos y resoluciones gubernamentales.</p>
+    </div>
+
+    <div 
+      class="drop-area" 
+      :class="{ 'is-dragover': isDragging, 'is-processing': isProcessing }"
+      @dragover.prevent="isDragging = true"
+      @dragleave.prevent="isDragging = false"
+      @drop.prevent="handleDrop"
+      @click="triggerFileInput"
+    >
+      <input 
+        type="file" 
+        ref="fileInput" 
+        accept="application/pdf" 
+        style="display: none;" 
+        @change="handleFileSelect"
+      />
+      
+      <div v-if="!isProcessing" class="drop-content">
+        <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#3498db" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+          <polyline points="14 2 14 8 20 8"></polyline>
+          <line x1="12" y1="18" x2="12" y2="12"></line>
+          <line x1="9" y1="15" x2="15" y2="15"></line>
+        </svg>
+        <p v-if="!selectedFile">Arrastre un archivo PDF aquí, o haga clic para seleccionar.</p>
+        <p v-else class="selected-file-name">Documento cargado: {{ selectedFile.name }}</p>
+        <small>Solo se procesarán documentos teóricos para el fallback estructurado.</small>
+      </div>
+
+      <div v-else class="processing-content">
+        <div class="spinner"></div>
+        <p>Procesando con IBM Docling...</p>
+        <small>Extrayendo tablas, ejecutando chunking y vectorizando texto.</small>
+      </div>
+    </div>
+
+    <div class="action-bar" v-if="selectedFile && !isProcessing">
+      <button class="btn-process" @click="processFile">Procesar e Indexar Documento</button>
+      <button class="btn-cancel" @click="clearSelection">Cancelar</button>
+    </div>
+
+    <div v-if="resultMessage" :class="['result-message', resultType]">
+      {{ resultMessage }}
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref } from 'vue';
+import api from '../services/api.js';
+
+const isDragging = ref(false);
+const isProcessing = ref(false);
+const resultMessage = ref('');
+const resultType = ref('');
+const fileInput = ref(null);
+const selectedFile = ref(null);
+
+const triggerFileInput = () => {
+  if (!isProcessing.value) {
+    fileInput.value.click();
+  }
+};
+
+const handleDrop = (event) => {
+  isDragging.value = false;
+  const files = event.dataTransfer.files;
+  if (files.length > 0 && files[0].type === 'application/pdf') {
+    selectedFile.value = files[0];
+    resultMessage.value = '';
+  } else {
+    resultType.value = 'error';
+    resultMessage.value = 'Formato inválido. Solo se admiten archivos PDF.';
+  }
+};
+
+const handleFileSelect = (event) => {
+  const files = event.target.files;
+  if (files.length > 0) {
+    selectedFile.value = files[0];
+    resultMessage.value = '';
+  }
+  fileInput.value.value = '';
+};
+
+const clearSelection = () => {
+  selectedFile.value = null;
+  resultMessage.value = '';
+};
+
+const processFile = async () => {
+  if (!selectedFile.value) return;
+
+  isProcessing.value = true;
+  resultMessage.value = '';
+
+  try {
+    const response = await api.uploadManual(selectedFile.value);
+    resultType.value = 'success';
+    resultMessage.value = `Documento vectorizado en ${response.processing_time_seconds}s. Chunks creados: ${response.chunks_created}.`;
+    selectedFile.value = null;
+  } catch (error) {
+    resultType.value = 'error';
+    const serverDetail = error.response?.data?.detail || error.message;
+    resultMessage.value = `Error en el procesamiento: ${serverDetail}`;
+  } finally {
+    isProcessing.value = false;
+  }
+};
+</script>
+
+<style scoped>
+.dropzone-container {
+  background-color: #ffffff;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  padding: 20px;
+  margin-bottom: 20px;
+  border-left: 4px solid #3498db;
+}
+
+.component-header h3 {
+  margin-top: 0;
+  margin-bottom: 5px;
+  color: #2c3e50;
+  font-size: 1.1rem;
+}
+
+.component-header p {
+  color: #7f8c8d;
+  font-size: 0.85rem;
+  margin-bottom: 15px;
+  margin-top: 0;
+}
+
+.drop-area {
+  border: 2px dashed #bdc3c7;
+  border-radius: 8px;
+  padding: 30px 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  background-color: #f9fbfd;
+}
+
+.drop-area:hover:not(.is-processing),
+.drop-area.is-dragover {
+  border-color: #3498db;
+  background-color: #ebf5fb;
+}
+
+.drop-area.is-processing {
+  cursor: wait;
+  border-color: #f39c12;
+  background-color: #fdfefe;
+}
+
+.drop-content p, .processing-content p {
+  margin: 10px 0 5px;
+  color: #2c3e50;
+  font-weight: 500;
+}
+
+.selected-file-name {
+  color: #2980b9 !important;
+  font-weight: bold !important;
+}
+
+.drop-content small, .processing-content small {
+  color: #7f8c8d;
+}
+
+.spinner {
+  border: 4px solid rgba(0, 0, 0, 0.1);
+  border-left-color: #f39c12;
+  border-radius: 50%;
+  width: 36px;
+  height: 36px;
+  animation: spin 1s linear infinite;
+  margin: 0 auto;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.action-bar {
+  display: flex;
+  gap: 10px;
+  margin-top: 15px;
+}
+
+.btn-process {
+  flex: 1;
+  background-color: #3498db;
+  color: white;
+  border: none;
+  padding: 10px;
+  border-radius: 4px;
+  font-weight: bold;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.btn-process:hover {
+  background-color: #2980b9;
+}
+
+.btn-cancel {
+  background-color: #ecf0f1;
+  color: #7f8c8d;
+  border: 1px solid #bdc3c7;
+  padding: 10px 15px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.btn-cancel:hover {
+  background-color: #e0e6ed;
+}
+
+.result-message {
+  margin-top: 15px;
+  padding: 10px;
+  border-radius: 4px;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.result-message.success {
+  background-color: #d4edda;
+  color: #155724;
+  border: 1px solid #c3e6cb;
+}
+
+.result-message.error {
+  background-color: #f8d7da;
+  color: #721c24;
+  border: 1px solid #f5c6cb;
+}
+</style>
+
+================================================================================
+ARCHIVO: frontend\src\components\Equalizer.vue
+================================================================================
+
+<template>
+  <div class="equalizer-container">
+    <div class="component-header">
+      <h3>Ecualizador de Personalidad</h3>
+      <p>Ajuste de parámetros de inferencia y umbral CBR.</p>
+    </div>
+
+    <div class="control-group">
+      <label for="profile-select">Perfil Lingüístico del LLM:</label>
+      <select id="profile-select" v-model="settings.userProfile" @change="emitUpdate">
+        <option value="operator">Supervisor Operativo (Lenguaje directo y heurístico)</option>
+        <option value="engineer">Ingeniero Ambiental (Rigor científico y termodinámico)</option>
+      </select>
+      <small class="helper-text">Modifica el System Prompt y la temperatura generativa.</small>
+    </div>
+
+    <div class="control-group">
+      <label for="threshold-slider">Umbral de Similitud CBR ({{ settings.similarityThreshold }}):</label>
+      <input 
+        type="range" 
+        id="threshold-slider" 
+        min="0.5" 
+        max="0.99" 
+        step="0.01" 
+        v-model.number="settings.similarityThreshold" 
+        @input="emitUpdate"
+      />
+      <div class="slider-labels">
+        <span>Más tolerante (RAG)</span>
+        <span>Más estricto (CBR puro)</span>
+      </div>
+      <small class="helper-text">
+        Define la distancia del coseno requerida para aceptar un caso empírico previo antes de consultar los manuales.
+      </small>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { reactive, watch } from 'vue';
+
+const emit = defineEmits(['update-settings']);
+
+const settings = reactive({
+  userProfile: 'operator',
+  similarityThreshold: 0.85
+});
+
+const emitUpdate = () => {
+  emit('update-settings', {
+    userProfile: settings.userProfile,
+    similarityThreshold: settings.similarityThreshold
+  });
+};
+
+// Emitir configuración inicial al montar el componente
+emitUpdate();
+</script>
+
+<style scoped>
+.equalizer-container {
+  background-color: #ffffff;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  padding: 20px;
+  margin-bottom: 20px;
+  border-left: 4px solid #8e44ad;
+}
+
+.component-header h3 {
+  margin-top: 0;
+  margin-bottom: 5px;
+  color: #2c3e50;
+  font-size: 1.1rem;
+}
+
+.component-header p {
+  color: #7f8c8d;
+  font-size: 0.85rem;
+  margin-bottom: 15px;
+  margin-top: 0;
+}
+
+.control-group {
+  margin-bottom: 15px;
+}
+
+label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: #34495e;
+  font-size: 0.95rem;
+}
+
+select {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #bdc3c7;
+  border-radius: 4px;
+  font-size: 0.95rem;
+  background-color: #f8f9fa;
+}
+
+input[type="range"] {
+  width: 100%;
+  margin-top: 5px;
+}
+
+.slider-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: #95a5a6;
+  margin-top: 5px;
+}
+
+.helper-text {
+  display: block;
+  font-size: 0.75rem;
+  color: #7f8c8d;
+  margin-top: 4px;
+}
+</style>
+
+================================================================================
+ARCHIVO: frontend\src\services\api.js
+================================================================================
+
+import axios from 'axios';
+
+// La URL base asume que el usuario accede al frontend a través de localhost 
+// y el backend expone sus puertos en el host.
+const API_BASE_URL = 'http://localhost:8000/api/v1';
+
+export const apiClient = axios.create({
+    baseURL: API_BASE_URL,
+    headers: {
+        'Content-Type': 'application/json',
+    },
+});
+
+export default {
+    /**
+     * Envía el reporte empírico a la base de datos vectorial (CBR).
+     * @param {Object} caseData - Objeto con symptoms, action_taken, result, author.
+     */
+    async submitEmpiricalCase(caseData) {
+        try {
+            const response = await apiClient.post('/empirical-case', caseData);
+            return response.data;
+        } catch (error) {
+            console.error('Error al enviar el caso empírico:', error);
+            throw error;
+        }
+    },
+
+    /**
+     * Sube un manual técnico en formato PDF para ser procesado por IBM Docling.
+     * @param {File} file - Archivo PDF.
+     */
+    async uploadManual(file) {
+        try {
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            const response = await apiClient.post('/upload-manual', formData, {
+                headers: {
+                    'Content-Type': 'multipart/form-data'
+                }
+            });
+            return response.data;
+        } catch (error) {
+            console.error('Error al subir el manual técnico:', error);
+            throw error;
+        }
+    }
+};
+
