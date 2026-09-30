@@ -1,5 +1,6 @@
 import os
 import logging
+from typing import List
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -30,6 +31,7 @@ class ManualUploadResponse(BaseModel):
     status: str
     processing_time_seconds: float
     chunks_created: int
+    files_processed: int
 
 _embedder_instance = None
 
@@ -43,10 +45,6 @@ def get_embedding(text_input: str) -> list:
 
 @router.post("/empirical-case", response_model=EmpiricalCaseResponse)
 async def create_empirical_case(case: EmpiricalCaseCreate):
-    """
-    Ingesta de conocimiento tácito (CBR).
-    Recibe los datos del operario, los vectoriza y los almacena en PostgreSQL.
-    """
     try:
         content_to_vectorize = f"SINTOMAS: {case.symptoms}\nACCION: {case.action_taken}\nRESULTADO: {case.result}"
         vector = get_embedding(content_to_vectorize)
@@ -84,9 +82,6 @@ async def create_empirical_case(case: EmpiricalCaseCreate):
 
 @router.get("/empirical-cases")
 async def get_empirical_cases():
-    """
-    Recupera todos los casos empíricos almacenados para ser visualizados en el panel de configuración.
-    """
     try:
         with engine.connect() as conn:
             query = text("""
@@ -115,10 +110,6 @@ async def get_empirical_cases():
 
 @router.put("/empirical-cases/{case_id}")
 async def update_empirical_case(case_id: int, case: EmpiricalCaseUpdate):
-    """
-    Actualiza un caso empírico existente. Obliga a recalcular el embedding vectorial
-    para asegurar la coherencia semántica con el nuevo texto modificado.
-    """
     try:
         content_to_vectorize = f"SINTOMAS: {case.symptoms}\nACCION: {case.action_taken}\nRESULTADO: {case.result}"
         vector = get_embedding(content_to_vectorize)
@@ -160,9 +151,6 @@ async def update_empirical_case(case_id: int, case: EmpiricalCaseUpdate):
 
 @router.delete("/empirical-cases/{case_id}")
 async def delete_empirical_case(case_id: int):
-    """
-    Elimina permanentemente un caso empírico de la base de datos vectorial.
-    """
     try:
         with engine.begin() as conn:
             result = conn.execute(
@@ -182,56 +170,68 @@ async def delete_empirical_case(case_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/upload-manual", response_model=ManualUploadResponse)
-async def upload_manual_endpoint(file: UploadFile = File(...)):
+async def upload_manual_endpoint(files: List[UploadFile] = File(...)):
     """
-    Ingesta normativa (RAG).
-    Procesa archivos PDF usando IBM Docling, genera fragmentos semánticos y los inserta en PostgreSQL.
+    Ingesta normativa (RAG) en lote.
+    Procesa múltiples archivos PDF secuencialmente usando IBM Docling, genera fragmentos semánticos y los inserta.
     """
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="El archivo debe tener un formato PDF.")
+    total_chunks = 0
+    total_time = 0.0
+    files_processed = 0
 
-    temp_file_path = f"/tmp/{file.filename}"
-    
-    try:
-        with open(temp_file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+    for file in files:
+        if not file.filename.endswith('.pdf'):
+            logger.warning(f"Archivo omitido por no ser PDF: {file.filename}")
+            continue
 
-        docling_result = await docling_service.process_pdf_to_markdown(temp_file_path)
+        temp_file_path = f"/tmp/{file.filename}"
         
-        if docling_result["status"] == "error":
-            raise Exception(docling_result["error_message"])
+        try:
+            with open(temp_file_path, "wb") as buffer:
+                content = await file.read()
+                buffer.write(content)
 
-        markdown_text = docling_result["markdown_content"]
-        
-        chunks = [chunk.strip() for chunk in markdown_text.split("\n\n") if len(chunk.strip()) > 50]
-        
-        inserted_chunks = 0
-        with engine.begin() as conn:
-            for chunk in chunks:
-                vector = get_embedding(chunk)
-                conn.execute(
-                    text("""
-                        INSERT INTO document_chunks (content, metadata, embedding)
-                        VALUES (:content, :metadata, :embedding)
-                    """),
-                    {
-                        "content": chunk,
-                        "metadata": file.filename,
-                        "embedding": str(vector)
-                    }
-                )
-                inserted_chunks += 1
+            docling_result = await docling_service.process_pdf_to_markdown(temp_file_path)
+            
+            if docling_result["status"] == "error":
+                logger.error(f"Fallo al decodificar {file.filename}: {docling_result.get('error_message')}")
+                continue
 
-        return ManualUploadResponse(
-            status="success",
-            processing_time_seconds=docling_result["processing_time_seconds"],
-            chunks_created=inserted_chunks
-        )
+            markdown_text = docling_result["markdown_content"]
+            total_time += docling_result["processing_time_seconds"]
+            
+            chunks = [chunk.strip() for chunk in markdown_text.split("\n\n") if len(chunk.strip()) > 50]
+            
+            with engine.begin() as conn:
+                for chunk in chunks:
+                    vector = get_embedding(chunk)
+                    conn.execute(
+                        text("""
+                            INSERT INTO document_chunks (content, metadata, embedding)
+                            VALUES (:content, :metadata, :embedding)
+                        """),
+                        {
+                            "content": chunk,
+                            "metadata": file.filename,
+                            "embedding": str(vector)
+                        }
+                    )
+                    total_chunks += 1
+            
+            files_processed += 1
 
-    except Exception as e:
-        logger.error(f"Error procesando manual normativo: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+        except Exception as e:
+            logger.error(f"Excepción general procesando archivo {file.filename}: {str(e)}")
+        finally:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+
+    if files_processed == 0:
+        raise HTTPException(status_code=500, detail="No se pudo extraer texto de ningún archivo proporcionado.")
+
+    return ManualUploadResponse(
+        status="success",
+        processing_time_seconds=round(total_time, 2),
+        chunks_created=total_chunks,
+        files_processed=files_processed
+    )

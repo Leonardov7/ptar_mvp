@@ -4,7 +4,6 @@
       <h1>Sistema Inteligente de Gestión del Conocimiento PTAR</h1>
       <div class="nav-controls">
         <span class="version">v1.0.0</span>
-        <!-- BOTÓN DE CONFIGURACIÓN Y GESTIÓN -->
         <button class="btn-config" @click="isConfigOpen = true" title="Configuraciones y Gestión">
           <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3"></circle>
@@ -29,7 +28,6 @@
       developed by Leonardo Valderrama and Gemini version 1.0.0
     </footer>
 
-    <!-- INYECCIÓN DEL MODAL DE CONFIGURACIÓN -->
     <ConfigModal v-if="isConfigOpen" @close="isConfigOpen = false" />
   </div>
 </template>
@@ -46,7 +44,7 @@ const isConfigOpen = ref(false);
 
 const currentSettings = ref({
   userProfile: 'operator',
-  similarityThreshold: 0.85
+  similarityThreshold: 0.50
 });
 
 const handleSettingsUpdate = (newSettings) => {
@@ -140,6 +138,8 @@ html, body {
   gap: 20px;
   overflow-y: auto;
   scrollbar-width: thin;
+  position: relative;
+  z-index: 20;
 }
 
 .control-panel::-webkit-scrollbar {
@@ -153,7 +153,10 @@ html, body {
 .inference-panel {
   flex: 1;
   min-width: 0;
+  position: relative;
+  z-index: 10;
 }
+
 .app-footer {
   text-align: right;
   padding: 8px 20px;

@@ -2,7 +2,7 @@
   <div class="dropzone-container">
     <div class="component-header">
       <h3>Ingesta Normativa</h3>
-      <p>Procesamiento de manuales técnicos y resoluciones gubernamentales.</p>
+      <p>Procesamiento masivo de manuales técnicos y normativas.</p>
     </div>
 
     <div 
@@ -11,12 +11,24 @@
       @dragover.prevent="isDragging = true"
       @dragleave.prevent="isDragging = false"
       @drop.prevent="handleDrop"
-      @click="triggerFileInput"
     >
+      <!-- Input oculto para múltiples archivos sueltos -->
       <input 
         type="file" 
         ref="fileInput" 
         accept="application/pdf" 
+        multiple
+        style="display: none;" 
+        @change="handleFileSelect"
+      />
+      <!-- Input oculto para carpetas enteras -->
+      <input 
+        type="file" 
+        ref="folderInput" 
+        accept="application/pdf" 
+        webkitdirectory 
+        directory 
+        multiple
         style="display: none;" 
         @change="handleFileSelect"
       />
@@ -28,18 +40,24 @@
           <line x1="12" y1="18" x2="12" y2="12"></line>
           <line x1="9" y1="15" x2="15" y2="15"></line>
         </svg>
-        <p v-if="!selectedFile">Arrastre un archivo PDF aquí, o haga clic para seleccionar.</p>
-        <p v-else class="selected-file-name">Documento cargado: {{ selectedFile.name }}</p>
+        <p v-if="selectedFiles.length === 0">Arrastre PDFs aquí</p>
+        <p v-else class="selected-file-name">{{ selectedFiles.length }} archivo(s) PDF detectado(s) en espera.</p>
+        
+        <div class="manual-triggers" v-if="selectedFiles.length === 0">
+          <button class="btn-trigger" @click.stop="triggerFileInput">Seleccionar Archivos</button>
+          <button class="btn-trigger" @click.stop="triggerFolderInput">Seleccionar Carpeta</button>
+        </div>
       </div>
 
       <div v-else class="processing-content">
         <div class="spinner"></div>
-        <p>Procesando documento...</p>
+        <p>Procesando lote de documentos...</p>
+        <small>Por favor no cierre esta ventana.</small>
       </div>
     </div>
 
-    <div class="action-bar" v-if="selectedFile && !isProcessing">
-      <button class="btn-process" @click="processFile">Procesar Documento</button>
+    <div class="action-bar" v-if="selectedFiles.length > 0 && !isProcessing">
+      <button class="btn-process" @click="processFiles">Procesar {{ selectedFiles.length }} Documentos</button>
       <button class="btn-cancel" @click="clearSelection">Cancelar</button>
     </div>
 
@@ -58,55 +76,69 @@ const isProcessing = ref(false);
 const resultMessage = ref('');
 const resultType = ref('');
 const fileInput = ref(null);
-const selectedFile = ref(null);
+const folderInput = ref(null);
+const selectedFiles = ref([]);
 
 const triggerFileInput = () => {
-  if (!isProcessing.value) {
-    fileInput.value.click();
+  if (!isProcessing.value) fileInput.value.click();
+};
+
+const triggerFolderInput = () => {
+  if (!isProcessing.value) folderInput.value.click();
+};
+
+const filterPdfs = (filesArray) => {
+  const pdfs = [];
+  for (let i = 0; i < filesArray.length; i++) {
+    if (filesArray[i].type === 'application/pdf' || filesArray[i].name.toLowerCase().endsWith('.pdf')) {
+      pdfs.push(filesArray[i]);
+    }
   }
+  return pdfs;
 };
 
 const handleDrop = (event) => {
   isDragging.value = false;
-  const files = event.dataTransfer.files;
-  if (files.length > 0 && files[0].type === 'application/pdf') {
-    selectedFile.value = files[0];
+  const droppedPdfs = filterPdfs(event.dataTransfer.files);
+  if (droppedPdfs.length > 0) {
+    selectedFiles.value = droppedPdfs;
     resultMessage.value = '';
   } else {
     resultType.value = 'error';
-    resultMessage.value = 'Formato inválido. Solo se admiten archivos PDF.';
+    resultMessage.value = 'No se detectaron archivos PDF válidos en la selección.';
   }
 };
 
 const handleFileSelect = (event) => {
-  const files = event.target.files;
-  if (files.length > 0) {
-    selectedFile.value = files[0];
+  const selected = filterPdfs(event.target.files);
+  if (selected.length > 0) {
+    selectedFiles.value = selected;
     resultMessage.value = '';
   }
   fileInput.value.value = '';
+  folderInput.value.value = '';
 };
 
 const clearSelection = () => {
-  selectedFile.value = null;
+  selectedFiles.value = [];
   resultMessage.value = '';
 };
 
-const processFile = async () => {
-  if (!selectedFile.value) return;
+const processFiles = async () => {
+  if (selectedFiles.value.length === 0) return;
 
   isProcessing.value = true;
   resultMessage.value = '';
 
   try {
-    const response = await api.uploadManual(selectedFile.value);
+    const response = await api.uploadManual(selectedFiles.value);
     resultType.value = 'success';
-    resultMessage.value = `Documento procesado correctamente.`;
-    selectedFile.value = null;
+    resultMessage.value = `Procesamiento exitoso. ${response.files_processed} documentos vectorizados en ${response.processing_time_seconds}s. Total fragmentos: ${response.chunks_created}.`;
+    selectedFiles.value = [];
   } catch (error) {
     resultType.value = 'error';
     const serverDetail = error.response?.data?.detail || error.message;
-    resultMessage.value = `Error en el procesamiento: ${serverDetail}`;
+    resultMessage.value = `Error crítico procesando el lote: ${serverDetail}`;
   } finally {
     isProcessing.value = false;
   }
@@ -140,9 +172,8 @@ const processFile = async () => {
 .drop-area {
   border: 2px dashed #bdc3c7;
   border-radius: 8px;
-  padding: 30px 20px;
+  padding: 20px 10px;
   text-align: center;
-  cursor: pointer;
   transition: all 0.3s ease;
   background-color: #f9fbfd;
 }
@@ -160,7 +191,7 @@ const processFile = async () => {
 }
 
 .drop-content p, .processing-content p {
-  margin: 10px 0 5px;
+  margin: 10px 0 10px;
   color: #2c3e50;
   font-weight: 500;
 }
@@ -170,8 +201,29 @@ const processFile = async () => {
   font-weight: bold !important;
 }
 
-.drop-content small, .processing-content small {
-  color: #7f8c8d;
+.manual-triggers {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  margin-top: 15px;
+}
+
+.btn-trigger {
+  background-color: #ecf0f1;
+  border: 1px solid #bdc3c7;
+  color: #34495e;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: bold;
+  transition: background-color 0.2s;
+  width: 80%;
+}
+
+.btn-trigger:hover {
+  background-color: #d5dbdb;
 }
 
 .spinner {
@@ -191,12 +243,12 @@ const processFile = async () => {
 
 .action-bar {
   display: flex;
+  flex-direction: column;
   gap: 10px;
   margin-top: 15px;
 }
 
 .btn-process {
-  flex: 1;
   background-color: #3498db;
   color: white;
   border: none;

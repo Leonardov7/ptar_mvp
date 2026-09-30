@@ -29,21 +29,31 @@ class DoclingProcessor:
             logger.info("Importando motor IBM Docling y modelos en tiempo de ejecución...")
             try:
                 from docling.document_converter import DocumentConverter
-                from docling.datamodel.pipeline_options import PdfPipelineOptions
                 
-                # Configuración de las opciones del pipeline para PDFs
-                pipeline_options = PdfPipelineOptions()
-                pipeline_options.do_table_structure = True
-                pipeline_options.do_ocr = True
+                # Se intenta cargar la configuración de OCR y Tablas. Si falla por la versión de la librería,
+                # se captura el error específico y se instancia el convertidor con su configuración por defecto.
+                try:
+                    from docling.datamodel.pipeline_options import PdfPipelineOptions
+                    
+                    # Configuración de las opciones del pipeline para PDFs
+                    pipeline_options = PdfPipelineOptions()
+                    pipeline_options.do_table_structure = True
+                    pipeline_options.do_ocr = True
+                    
+                    # Inicialización pasando explícitamente las opciones al convertidor
+                    self.converter = DocumentConverter(pdf_pipeline_options=pipeline_options)
+                    logger.info("IBM Docling DocumentConverter inicializado con soporte OCR extendido.")
+                    
+                except Exception as fallback_e:
+                    # Captura amplia para cualquier fallo de dependencias internas de OCR
+                    logger.warning(f"Fallo al cargar opciones avanzadas de Docling ({str(fallback_e)}). Instanciando DocumentConverter con configuración base.")
+                    # Inicialización del convertidor de documentos (soporta PDF de forma nativa)
+                    self.converter = DocumentConverter()
                 
-                # Inicialización del convertidor de documentos (soporta PDF de forma nativa)
-                # Se omite allowed_formats=[InputFormat.PDF] para prevenir el ImportError de rutas obsoletas.
-                self.converter = DocumentConverter()
-                
-                logger.info("IBM Docling DocumentConverter inicializado correctamente.")
             except Exception as e:
                 logger.error(f"Error crítico al inicializar Docling: {str(e)}")
                 raise e
+                
         return self.converter
 
     async def process_pdf_to_markdown(self, file_path: str) -> Dict[str, Any]:
@@ -69,7 +79,6 @@ class DoclingProcessor:
             converter = self._get_converter()
             
             # La conversión en Docling puede ser un proceso bloqueante pesado.
-            # En un entorno de producción estricto con FastAPI, esto podría envolverse en run_in_threadpool
             conversion_result = converter.convert(file_path)
             
             # Exportar el documento decodificado a formato Markdown

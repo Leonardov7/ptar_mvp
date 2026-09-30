@@ -9,15 +9,7 @@
     <div class="control-group">
       <label class="label-with-help">
         Perfil del Asistente:
-        <div class="popover-wrapper">
-          <button class="help-btn" @click.stop="togglePopover('profile')">?</button>
-          
-          <div class="popover-content" v-if="activePopover === 'profile'" @click.stop>
-            <h4>¿Cómo afecta el Perfil al Modelo?</h4>
-            <p><strong>1. Temperatura Generativa (Entropía):</strong> El Ingeniero opera con una temperatura de 0.0, lo que significa que el motor buscará siempre el token más probable matemáticamente, eliminando la creatividad para priorizar la exactitud algorítmica. El Operario opera a 0.1, permitiendo una ligera flexibilidad lingüística para que la respuesta suene más humana.</p>
-            <p><strong>2. Inyección de Prompt del Sistema:</strong> Al cambiar el perfil, se altera el marco de referencia bajo el cual el modelo interpreta los vectores extraídos. El Ingeniero recibe la orden explícita de responder con termodinámica, cinética de reactores y parámetros fisicoquímicos. El Operario recibe la orden de traducir los hallazgos en instrucciones secuenciales de campo.</p>
-          </div>
-        </div>
+        <button class="help-btn" @click.stop="(e) => togglePopover('profile', e)">?</button>
       </label>
       <select id="profile-select" v-model="settings.userProfile" @change="emitUpdate">
         <option value="operator">Supervisor Operativo (Lenguaje directo)</option>
@@ -29,23 +21,12 @@
     <div class="control-group">
       <label class="label-with-help">
         Precisión de Búsqueda Histórica ({{ settings.similarityThreshold }}):
-        <div class="popover-wrapper">
-          <button class="help-btn" @click.stop="togglePopover('precision')">?</button>
-          
-          <div class="popover-content" v-if="activePopover === 'precision'" @click.stop>
-            <h4>Similitud del Coseno en el Espacio Vectorial</h4>
-            <p>El sistema transforma el texto de su pregunta en un vector denso de 384 dimensiones. Esta barra controla la <strong>distancia matemática máxima</strong> permitida entre su vector de búsqueda y los vectores almacenados en la base de datos PostgreSQL.</p>
-            <ul>
-              <li><strong>Hacia 0.99 (Más Estricto):</strong> Exige que los síntomas descritos sean semánticamente idénticos al registro previo. Útil para evitar falsos positivos cuando el problema es muy específico.</li>
-              <li><strong>Hacia 0.50 (Más Tolerante):</strong> Permite recuperar casos que tratan temas correlacionados, aunque las palabras utilizadas por el operario anterior hayan sido distintas. Si el umbral es muy bajo, el modelo puede intentar resolver un problema usando un contexto incorrecto.</li>
-            </ul>
-          </div>
-        </div>
+        <button class="help-btn" @click.stop="(e) => togglePopover('precision', e)">?</button>
       </label>
       <input 
         type="range" 
         id="threshold-slider" 
-        min="0.5" 
+        min="0.2" 
         max="0.99" 
         step="0.01" 
         v-model.number="settings.similarityThreshold" 
@@ -56,6 +37,29 @@
         <span>Más estricto</span>
       </div>
     </div>
+
+    <!-- PORTAL DE BURBUJAS DE AYUDA AL BODY -->
+    <Teleport to="body">
+      <div v-if="activePopover === 'profile'" class="popover-content" :style="popoverStyle" @click.stop>
+        <div class="popover-arrow"></div>
+        <h4>Comportamiento del Asistente</h4>
+        <p>El perfil ajusta la forma en que el sistema analiza la información y se comunica con usted:</p>
+        <ul>
+          <li><strong>Supervisor Operativo:</strong> Se enfoca en la práctica. Le dará instrucciones directas y fáciles de aplicar en campo para resolver el problema sin rodeos teóricos.</li>
+          <li><strong>Ingeniero Ambiental:</strong> Se enfoca en el análisis profundo. Utilizará parámetros de calidad del agua y explicaciones científicas para diagnosticar la raíz de la falla.</li>
+        </ul>
+      </div>
+
+      <div v-if="activePopover === 'precision'" class="popover-content" :style="popoverStyle" @click.stop>
+        <div class="popover-arrow"></div>
+        <h4>Aproximación de Casos</h4>
+        <p>Esta barra controla qué tan exacto debe ser el problema que usted describe comparado con los reportes anteriores almacenados en la bitácora.</p>
+        <ul>
+          <li><strong>Hacia la derecha (Más Estricto):</strong> El sistema priorizará la lectura de documentación oficial, a menos que logre encontrar un caso empírico que sea idéntico a su problema.</li>
+          <li><strong>Hacia la izquierda (Más Tolerante):</strong> El sistema le dará mayor peso a la experiencia de otros operarios, enlazando casos basándose en el contexto, incluso si utilizaron palabras distintas a las suyas.</li>
+        </ul>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -66,10 +70,11 @@ const emit = defineEmits(['update-settings']);
 
 const settings = reactive({
   userProfile: 'operator',
-  similarityThreshold: 0.85
+  similarityThreshold: 0.50
 });
 
 const activePopover = ref(null);
+const popoverStyle = reactive({ top: '0px', left: '0px' });
 
 const emitUpdate = () => {
   emit('update-settings', {
@@ -78,10 +83,14 @@ const emitUpdate = () => {
   });
 };
 
-const togglePopover = (popoverName) => {
+const togglePopover = (popoverName, event) => {
   if (activePopover.value === popoverName) {
     activePopover.value = null;
   } else {
+    // Calculamos las coordenadas del botón interactuado de manera absoluta en el documento
+    const rect = event.target.getBoundingClientRect();
+    popoverStyle.top = `${rect.bottom + 12}px`;
+    popoverStyle.left = `${rect.left - 15}px`;
     activePopover.value = popoverName;
   }
 };
@@ -90,7 +99,6 @@ const closePopovers = () => {
   activePopover.value = null;
 };
 
-// Escucha clics en cualquier parte de la ventana para cerrar los modales flotantes
 onMounted(() => {
   document.addEventListener('click', closePopovers);
   emitUpdate();
@@ -139,23 +147,17 @@ onBeforeUnmount(() => {
   font-size: 0.95rem;
 }
 
-/* Lógica de Modales Flotantes */
-.popover-wrapper {
-  position: relative;
-  display: inline-block;
-}
-
 .help-btn {
   display: flex;
   justify-content: center;
   align-items: center;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   background-color: #3498db;
   color: white;
   border-radius: 50%;
   border: none;
-  font-size: 0.75rem;
+  font-size: 0.85rem;
   font-weight: bold;
   cursor: pointer;
   transition: background-color 0.2s;
@@ -163,62 +165,6 @@ onBeforeUnmount(() => {
 
 .help-btn:hover {
   background-color: #2980b9;
-}
-
-.popover-content {
-  position: absolute;
-  top: 25px;
-  left: 0;
-  width: 320px;
-  background-color: #ffffff;
-  border: 1px solid #bdc3c7;
-  border-radius: 8px;
-  padding: 15px;
-  box-shadow: 0 8px 20px rgba(0,0,0,0.15);
-  z-index: 1000;
-  cursor: default;
-}
-
-.popover-content::before {
-  content: "";
-  position: absolute;
-  top: -6px;
-  left: 5px;
-  width: 10px;
-  height: 10px;
-  background-color: #ffffff;
-  border-top: 1px solid #bdc3c7;
-  border-left: 1px solid #bdc3c7;
-  transform: rotate(45deg);
-}
-
-.popover-content h4 {
-  margin-top: 0;
-  margin-bottom: 10px;
-  color: #2c3e50;
-  font-size: 0.95rem;
-  border-bottom: 1px solid #ecf0f1;
-  padding-bottom: 5px;
-}
-
-.popover-content p {
-  margin: 0 0 10px 0;
-  color: #34495e;
-  font-size: 0.85rem;
-  line-height: 1.4;
-  font-weight: normal;
-}
-
-.popover-content ul {
-  margin: 0;
-  padding-left: 20px;
-  color: #34495e;
-  font-size: 0.85rem;
-  font-weight: normal;
-}
-
-.popover-content li {
-  margin-bottom: 5px;
 }
 
 select {
@@ -243,5 +189,59 @@ input[type="range"] {
   font-size: 0.75rem;
   color: #95a5a6;
   margin-top: 5px;
+}
+</style>
+
+<style>
+/* Estilos globales para el portal Teleport */
+.popover-content {
+  position: fixed;
+  width: 320px;
+  background-color: #ffffff;
+  border: 1px solid #bdc3c7;
+  border-radius: 8px;
+  padding: 15px;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+  z-index: 9999;
+  cursor: default;
+}
+
+.popover-arrow {
+  position: absolute;
+  top: -6px;
+  left: 20px;
+  width: 10px;
+  height: 10px;
+  background-color: #ffffff;
+  border-top: 1px solid #bdc3c7;
+  border-left: 1px solid #bdc3c7;
+  transform: rotate(45deg);
+}
+
+.popover-content h4 {
+  margin-top: 0;
+  margin-bottom: 10px;
+  color: #2c3e50;
+  font-size: 0.95rem;
+  border-bottom: 1px solid #ecf0f1;
+  padding-bottom: 5px;
+}
+
+.popover-content p {
+  margin: 0 0 10px 0;
+  color: #34495e;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.popover-content ul {
+  margin: 0;
+  padding-left: 20px;
+  color: #34495e;
+  font-size: 0.85rem;
+}
+
+.popover-content li {
+  margin-bottom: 5px;
 }
 </style>
