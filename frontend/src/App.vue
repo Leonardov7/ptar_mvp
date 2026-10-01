@@ -25,7 +25,7 @@
       </section>
     </main>
     <footer class="app-footer">
-      developed by Leonardo Valderrama and Gemini version 1.0.0
+       version 1.0.0
     </footer>
 
     <ConfigModal v-if="isConfigOpen" @close="isConfigOpen = false" />

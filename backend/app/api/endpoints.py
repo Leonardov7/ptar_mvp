@@ -184,7 +184,9 @@ async def upload_manual_endpoint(files: List[UploadFile] = File(...)):
             logger.warning(f"Archivo omitido por no ser PDF: {file.filename}")
             continue
 
-        temp_file_path = f"/tmp/{file.filename}"
+        # Extracción del nombre base para evadir carpetas inexistentes en el contenedor
+        safe_filename = os.path.basename(file.filename)
+        temp_file_path = f"/tmp/{safe_filename}"
         
         try:
             with open(temp_file_path, "wb") as buffer:
@@ -194,7 +196,7 @@ async def upload_manual_endpoint(files: List[UploadFile] = File(...)):
             docling_result = await docling_service.process_pdf_to_markdown(temp_file_path)
             
             if docling_result["status"] == "error":
-                logger.error(f"Fallo al decodificar {file.filename}: {docling_result.get('error_message')}")
+                logger.error(f"Fallo al decodificar {safe_filename}: {docling_result.get('error_message')}")
                 continue
 
             markdown_text = docling_result["markdown_content"]
@@ -212,7 +214,7 @@ async def upload_manual_endpoint(files: List[UploadFile] = File(...)):
                         """),
                         {
                             "content": chunk,
-                            "metadata": file.filename,
+                            "metadata": safe_filename,
                             "embedding": str(vector)
                         }
                     )
@@ -221,7 +223,7 @@ async def upload_manual_endpoint(files: List[UploadFile] = File(...)):
             files_processed += 1
 
         except Exception as e:
-            logger.error(f"Excepción general procesando archivo {file.filename}: {str(e)}")
+            logger.error(f"Excepción general procesando archivo {safe_filename}: {str(e)}")
         finally:
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)

@@ -114,11 +114,8 @@ from sqlalchemy import text
 
 from app.core.config import engine, Base
 
-try:
-    # Se enruta a la capa de dominio físico (ORM) para la creación de tablas
-    from app.models.domain import * 
-except ImportError:
-    pass
+# Importación absoluta para garantizar el registro del esquema en Base.metadata
+import app.models
 
 from app.api.endpoints import router as api_router
 from app.api.websocket import router as ws_router
@@ -219,6 +216,7 @@ ARCHIVO: backend\app\api\endpoints.py
 
 import os
 import logging
+from typing import List
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -234,6 +232,12 @@ class EmpiricalCaseCreate(BaseModel):
     action_taken: str
     result: str
 
+class EmpiricalCaseUpdate(BaseModel):
+    author: str
+    symptoms: str
+    action_taken: str
+    result: str
+
 class EmpiricalCaseResponse(BaseModel):
     id: int
     status: str
@@ -243,6 +247,7 @@ class ManualUploadResponse(BaseModel):
     status: str
     processing_time_seconds: float
     chunks_created: int
+    files_processed: int
 
 _embedder_instance = None
 
@@ -256,20 +261,16 @@ def get_embedding(text_input: str) -> list:
 
 @router.post("/empirical-case", response_model=EmpiricalCaseResponse)
 async def create_empirical_case(case: EmpiricalCaseCreate):
-    """
-    Ingesta de conocimiento tácito (CBR).
-    Recibe los datos del operario, los vectoriza y los almacena en PostgreSQL.
-    """
     try:
-        content_to_vectorize = f"Síntomas: {case.symptoms}. Acción: {case.action_taken}. Resultado: {case.result}"
+        content_to_vectorize = f"SINTOMAS: {case.symptoms}\nACCION: {case.action_taken}\nRESULTADO: {case.result}"
         vector = get_embedding(content_to_vectorize)
         vector_str = str(vector)
 
         with engine.begin() as conn:
             result = conn.execute(
                 text("""
-                    INSERT INTO knowledge_vectors (author, symptoms, action_taken, result, embedding)
-                    VALUES (:author, :symptoms, :action_taken, :result, :embedding)
+                    INSERT INTO knowledge_vectors (author, symptoms, action_taken, result, content, source_type, embedding)
+                    VALUES (:author, :symptoms, :action_taken, :result, :content, 'empirical_case', :embedding)
                     RETURNING id;
                 """),
                 {
@@ -277,6 +278,7 @@ async def create_empirical_case(case: EmpiricalCaseCreate):
                     "symptoms": case.symptoms,
                     "action_taken": case.action_taken,
                     "result": case.result,
+                    "content": content_to_vectorize,
                     "embedding": vector_str
                 }
             )
@@ -294,60 +296,163 @@ async def create_empirical_case(case: EmpiricalCaseCreate):
         logger.error(f"Fallo en la inserción del caso CBR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/upload-manual", response_model=ManualUploadResponse)
-async def upload_manual_endpoint(file: UploadFile = File(...)):
-    """
-    Ingesta normativa (RAG).
-    Procesa archivos PDF usando IBM Docling, genera fragmentos semánticos y los inserta en PostgreSQL.
-    """
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="El archivo debe tener un formato PDF.")
-
-    temp_file_path = f"/tmp/{file.filename}"
-    
+@router.get("/empirical-cases")
+async def get_empirical_cases():
     try:
-        with open(temp_file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-
-        docling_result = await docling_service.process_pdf_to_markdown(temp_file_path)
-        
-        if docling_result["status"] == "error":
-            raise Exception(docling_result["error_message"])
-
-        markdown_text = docling_result["markdown_content"]
-        
-        chunks = [chunk.strip() for chunk in markdown_text.split("\n\n") if len(chunk.strip()) > 50]
-        
-        inserted_chunks = 0
-        with engine.begin() as conn:
-            for chunk in chunks:
-                vector = get_embedding(chunk)
-                conn.execute(
-                    text("""
-                        INSERT INTO document_chunks (content, metadata, embedding)
-                        VALUES (:content, :metadata, :embedding)
-                    """),
-                    {
-                        "content": chunk,
-                        "metadata": file.filename,
-                        "embedding": str(vector)
-                    }
-                )
-                inserted_chunks += 1
-
-        return ManualUploadResponse(
-            status="success",
-            processing_time_seconds=docling_result["processing_time_seconds"],
-            chunks_created=inserted_chunks
-        )
-
+        with engine.connect() as conn:
+            query = text("""
+                SELECT id, author, symptoms, action_taken, result, created_at 
+                FROM knowledge_vectors 
+                WHERE source_type = 'empirical_case' 
+                ORDER BY created_at DESC
+            """)
+            result = conn.execute(query).fetchall()
+            
+            cases = []
+            for row in result:
+                cases.append({
+                    "id": row.id,
+                    "author": row.author,
+                    "symptoms": row.symptoms,
+                    "action_taken": row.action_taken,
+                    "result": row.result,
+                    "created_at": row.created_at.isoformat() if row.created_at else None
+                })
+                
+        return {"status": "success", "data": cases}
     except Exception as e:
-        logger.error(f"Error procesando manual normativo: {str(e)}")
+        logger.error(f"Error al consultar casos empíricos: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+
+@router.put("/empirical-cases/{case_id}")
+async def update_empirical_case(case_id: int, case: EmpiricalCaseUpdate):
+    try:
+        content_to_vectorize = f"SINTOMAS: {case.symptoms}\nACCION: {case.action_taken}\nRESULTADO: {case.result}"
+        vector = get_embedding(content_to_vectorize)
+        vector_str = str(vector)
+
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("""
+                    UPDATE knowledge_vectors 
+                    SET author = :author, 
+                        symptoms = :symptoms, 
+                        action_taken = :action_taken, 
+                        result = :result, 
+                        content = :content, 
+                        embedding = :embedding 
+                    WHERE id = :id AND source_type = 'empirical_case'
+                """),
+                {
+                    "id": case_id,
+                    "author": case.author,
+                    "symptoms": case.symptoms,
+                    "action_taken": case.action_taken,
+                    "result": case.result,
+                    "content": content_to_vectorize,
+                    "embedding": vector_str
+                }
+            )
+            if result.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Caso empírico no encontrado.")
+
+        logger.info(f"Caso empírico ID {case_id} actualizado y re-vectorizado exitosamente.")
+        return {"status": "success", "message": "Caso actualizado y re-vectorizado correctamente."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error al actualizar caso empírico ID {case_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/empirical-cases/{case_id}")
+async def delete_empirical_case(case_id: int):
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("DELETE FROM knowledge_vectors WHERE id = :id AND source_type = 'empirical_case'"),
+                {"id": case_id}
+            )
+            if result.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Caso empírico no encontrado.")
+
+        logger.info(f"Caso empírico ID {case_id} eliminado exitosamente.")
+        return {"status": "success", "message": "Caso eliminado correctamente."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error al eliminar caso empírico ID {case_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/upload-manual", response_model=ManualUploadResponse)
+async def upload_manual_endpoint(files: List[UploadFile] = File(...)):
+    """
+    Ingesta normativa (RAG) en lote.
+    Procesa múltiples archivos PDF secuencialmente usando IBM Docling, genera fragmentos semánticos y los inserta.
+    """
+    total_chunks = 0
+    total_time = 0.0
+    files_processed = 0
+
+    for file in files:
+        if not file.filename.endswith('.pdf'):
+            logger.warning(f"Archivo omitido por no ser PDF: {file.filename}")
+            continue
+
+        # Extracción del nombre base para evadir carpetas inexistentes en el contenedor
+        safe_filename = os.path.basename(file.filename)
+        temp_file_path = f"/tmp/{safe_filename}"
+        
+        try:
+            with open(temp_file_path, "wb") as buffer:
+                content = await file.read()
+                buffer.write(content)
+
+            docling_result = await docling_service.process_pdf_to_markdown(temp_file_path)
+            
+            if docling_result["status"] == "error":
+                logger.error(f"Fallo al decodificar {safe_filename}: {docling_result.get('error_message')}")
+                continue
+
+            markdown_text = docling_result["markdown_content"]
+            total_time += docling_result["processing_time_seconds"]
+            
+            chunks = [chunk.strip() for chunk in markdown_text.split("\n\n") if len(chunk.strip()) > 50]
+            
+            with engine.begin() as conn:
+                for chunk in chunks:
+                    vector = get_embedding(chunk)
+                    conn.execute(
+                        text("""
+                            INSERT INTO document_chunks (content, metadata, embedding)
+                            VALUES (:content, :metadata, :embedding)
+                        """),
+                        {
+                            "content": chunk,
+                            "metadata": safe_filename,
+                            "embedding": str(vector)
+                        }
+                    )
+                    total_chunks += 1
+            
+            files_processed += 1
+
+        except Exception as e:
+            logger.error(f"Excepción general procesando archivo {safe_filename}: {str(e)}")
+        finally:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+
+    if files_processed == 0:
+        raise HTTPException(status_code=500, detail="No se pudo extraer texto de ningún archivo proporcionado.")
+
+    return ManualUploadResponse(
+        status="success",
+        processing_time_seconds=round(total_time, 2),
+        chunks_created=total_chunks,
+        files_processed=files_processed
+    )
 
 ================================================================================
 ARCHIVO: backend\app\api\websocket.py
@@ -365,10 +470,6 @@ logger = logging.getLogger(__name__)
 _embedder_instance = None
 
 def get_embedding(text_input: str) -> list:
-    """
-    Transforma el texto de entrada en un vector denso.
-    Se aplica importación diferida absoluta para evitar bloqueos de Uvicorn en el arranque.
-    """
     global _embedder_instance
     if _embedder_instance is None:
         logger.info("Importando librerías pesadas de Machine Learning en tiempo de ejecución...")
@@ -386,16 +487,25 @@ PROFILES = {
     "operator": {
         "temperature": 0.3,
         "system": (
-            "Eres el Asistente Operativo de la PTAR. Tu rol es guiar al personal de planta. "
-            "Usa lenguaje claro, directo y enfocado en la solución paso a paso. "
-            "Evita análisis teóricos complejos a menos que se requieran estrictamente."
+            "Eres el Asistente Operativo de la PTAR. Tu único propósito es brindar soluciones técnicas, directas y prácticas al personal de planta. "
+            "REGLAS ESTRICTAS E INQUEBRANTABLES: "
+            "1. Analiza el [HISTORIAL DE LA CONVERSACIÓN] para mantener la fluidez del diagnóstico. "
+            "2. Si el [CONTEXTO PTAR] contiene información, enumera de inmediato las posibles causas y las acciones operativas a ejecutar. "
+            "3. NUNCA utilices frases como 'Según la base de datos', 'En mis manuales', 'No tengo información' o 'El contexto dice'. Responde con naturalidad humana. "
+            "4. Si la consulta es genérica o el contexto dice 'AMBIGUO_O_VACIO', asume un rol proactivo: propone de inmediato las causas operativas más probables basadas en los principios de tratamiento de aguas, y finaliza tu mensaje con MÁXIMO UNA (1) sola pregunta para ayudar a acotar la falla. "
+            "5. PRIORIDAD ABSOLUTA: Siempre ofrece valor técnico y soluciones primero. Tienes estrictamente prohibido responder únicamente con preguntas."
         )
     },
     "engineer": {
         "temperature": 0.1,
         "system": (
-            "Eres el Ingeniero Jefe Analítico de la PTAR. Tu rol es el diagnóstico profundo. "
-            "Usa terminología técnica, fisicoquímica y termodinámica rigurosa."
+            "Eres el Ingeniero Jefe Analítico de la PTAR. Tu rol es el diagnóstico fenomenológico profundo. "
+            "REGLAS ESTRICTAS E INQUEBRANTABLES: "
+            "1. Revisa el [HISTORIAL DE LA CONVERSACIÓN] para garantizar trazabilidad. "
+            "2. Si el [CONTEXTO PTAR] contiene datos, explica la anomalía y dicta acciones correctivas usando rigor termodinámico y fisicoquímico. "
+            "3. NUNCA declares que tu información proviene de un contexto, vector o base de datos. "
+            "4. Si el escenario es difuso o el contexto dice 'AMBIGUO_O_VACIO', formula de inmediato una hipótesis de ingeniería enumerando los posibles fallos en los equipos y formula MÁXIMO UNA (1) solicitud de variables de estado (presión, caudal, DBO, turbidez, etc.) al final de tu diagnóstico. "
+            "5. PRIORIDAD ABSOLUTA: Tienes prohibido devolver un mensaje que solo contenga preguntas. Entrega siempre un diagnóstico preliminar exhaustivo."
         )
     }
 }
@@ -404,84 +514,107 @@ PROFILES = {
 async def websocket_chat_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Túnel WebSocket TCP establecido con éxito.")
+    
+    # Memoria de sesión instanciada. Retendrá el contexto mientras el túnel TCP siga vivo.
+    session_history = []
 
     try:
-        with engine.connect() as db_connection:
-            while True:
-                raw_payload = await websocket.receive_text()
+        while True:
+            raw_payload = await websocket.receive_text()
+            
+            try:
+                data = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                continue
+
+            user_message = data.get("message", "")
+            profile_key = data.get("profile", "operator")
+            threshold = float(data.get("threshold", 0.85))
+
+            if not user_message:
+                continue
+
+            query_vector = get_embedding(user_message)
+            if not query_vector:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "content": "El motor de vectorización falló al cargar."
+                }))
+                continue
                 
-                try:
-                    data = json.loads(raw_payload)
-                except json.JSONDecodeError:
-                    continue
+            vector_str = str(query_vector)
 
-                user_message = data.get("message", "")
-                profile_key = data.get("profile", "operator")
-                threshold = float(data.get("threshold", 0.85))
+            try:
+                with engine.connect() as db_connection:
+                    # Inyección del ID en la selección CBR
+                    cbr_query = text("""
+                        SELECT id, author, symptoms, action_taken, result,
+                               1 - (embedding <=> CAST(:vec AS vector)) AS similarity
+                        FROM knowledge_vectors
+                        WHERE 1 - (embedding <=> CAST(:vec AS vector)) >= :threshold
+                          AND source_type = 'empirical_case'
+                        ORDER BY similarity DESC
+                        LIMIT 1
+                    """)
 
-                if not user_message:
-                    continue
+                    cbr_result = db_connection.execute(cbr_query, {"vec": vector_str, "threshold": threshold}).fetchone()
 
-                query_vector = get_embedding(user_message)
-                if not query_vector:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "content": "El motor de vectorización falló al cargar."
-                    }))
-                    continue
-                    
-                vector_str = str(query_vector)
+                    strategy = ""
+                    context_data = ""
+                    sources_list = []
 
-                cbr_query = text("""
-                    SELECT author, symptoms, action_taken, result,
-                           1 - (embedding <=> :vec) AS similarity
-                    FROM knowledge_vectors
-                    WHERE 1 - (embedding <=> :vec) >= :threshold
-                    ORDER BY similarity DESC
-                    LIMIT 1
-                """)
-
-                cbr_result = db_connection.execute(cbr_query, {"vec": vector_str, "threshold": threshold}).fetchone()
-
-                strategy = ""
-                context_data = ""
-
-                if cbr_result:
-                    strategy = f"Razonamiento Basado en Casos (CBR) - Similitud Semántica: {cbr_result.similarity:.2f}"
-                    context_data = (
-                        f"CASO HISTÓRICO EMPÍRICO:\n"
-                        f"Autor: {cbr_result.author}\n"
-                        f"Síntomas: {cbr_result.symptoms}\n"
-                        f"Acción ejecutada: {cbr_result.action_taken}\n"
-                        f"Resultado final: {cbr_result.result}"
-                    )
-                else:
-                    strategy = "Generación Aumentada (RAG) - Fallback Técnico"
-                    try:
+                    if cbr_result:
+                        strategy = "Bitácora Histórica Operativa"
+                        context_data = (
+                            f"CASO HISTÓRICO EMPÍRICO:\n"
+                            f"ID: {cbr_result.id}\n"
+                            f"Autor: {cbr_result.author}\n"
+                            f"Síntomas: {cbr_result.symptoms}\n"
+                            f"Acción ejecutada: {cbr_result.action_taken}\n"
+                            f"Resultado final: {cbr_result.result}"
+                        )
+                        sources_list.append({
+                            "author": f"Caso ID: {cbr_result.id} - {cbr_result.author}",
+                            "similarity": cbr_result.similarity
+                        })
+                    else:
+                        # Inyección del ID en la selección de RAG
                         rag_query = text("""
-                            SELECT content, metadata, 
-                                   1 - (embedding <=> :vec) AS similarity
+                            SELECT id, content, metadata, 
+                                   1 - (embedding <=> CAST(:vec AS vector)) AS similarity
                             FROM document_chunks
+                            WHERE 1 - (embedding <=> CAST(:vec AS vector)) >= :threshold_rag
                             ORDER BY similarity DESC
                             LIMIT 2
                         """)
-                        rag_results = db_connection.execute(rag_query, {"vec": vector_str}).fetchall()
+                        rag_results = db_connection.execute(rag_query, {"vec": vector_str, "threshold_rag": threshold - 0.1}).fetchall()
                         
                         if rag_results:
-                            fragments = [f"Extracto ({row.metadata}):\n{row.content}" for row in rag_results]
+                            strategy = "Manuales y Normativa Técnica"
+                            fragments = [f"Extracto (Doc ID {row.id} - {row.metadata}):\n{row.content}" for row in rag_results]
                             context_data = "\n\n".join(fragments)
+                            for row in rag_results:
+                                sources_list.append({
+                                    "author": f"Documento ID: {row.id} - {row.metadata}",
+                                    "similarity": row.similarity
+                                })
                         else:
-                            context_data = "No hay normatividad disponible. Usa conocimiento teórico universal."
-                    except Exception:
-                        context_data = "Sistema documental vacío. Usa conocimiento teórico base."
+                            strategy = "Análisis Teórico"
+                            context_data = "AMBIGUO_O_VACIO"
 
                 await websocket.send_text(json.dumps({
                     "type": "metadata",
                     "strategy": strategy,
-                    "content": ""
+                    "sources_used": sources_list
                 }))
 
-                # Importación diferida de LangChain para aislar la memoria
+                # Formateo dinámico del historial de los últimos 6 turnos para proteger la ventana de contexto
+                history_text = ""
+                if session_history:
+                    history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in session_history[-6:]])
+                else:
+                    history_text = "Inicio de la conversación."
+
                 from langchain_community.llms import Ollama
                 from langchain.prompts import PromptTemplate
 
@@ -493,38 +626,45 @@ async def websocket_chat_endpoint(websocket: WebSocket):
                 )
 
                 prompt_t = PromptTemplate(
-                    input_variables=["system", "context", "question"],
-                    template="{system}\n\n[CONTEXTO PTAR]\n{context}\n\n[PREGUNTA]\n{question}\n\nRespuesta:"
+                    input_variables=["system", "history", "context", "question"],
+                    template="{system}\n\n[HISTORIAL DE LA CONVERSACIÓN]\n{history}\n\n[CONTEXTO PTAR]\n{context}\n\n[PREGUNTA DEL OPERARIO]\n{question}\n\nRespuesta Directa:"
                 )
 
                 prompt_formatted = prompt_t.format(
                     system=profile["system"],
+                    history=history_text,
                     context=context_data,
                     question=user_message
                 )
 
+                full_response = ""
                 for chunk in llm.stream(prompt_formatted):
+                    full_response += chunk
                     await websocket.send_text(json.dumps({
                         "type": "token",
                         "content": chunk
                     }))
 
+                # Inserción en la memoria a corto plazo al finalizar el flujo de tokens
+                session_history.append({"role": "OPERARIO", "content": user_message})
+                session_history.append({"role": "ASISTENTE", "content": full_response})
+
                 await websocket.send_text(json.dumps({
-                    "type": "end",
+                    "type": "end_of_stream",
                     "content": ""
                 }))
 
+            except Exception as e:
+                logger.error(f"Fallo interno en la cadena lógica: {str(e)}")
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "content": f"Fallo lógico en base de datos: {str(e)}"
+                }))
+
     except WebSocketDisconnect:
-        logger.info("Cliente desconectado de manera limpia.")
+        logger.info("Cliente desconectado.")
     except Exception as e:
-        logger.error(f"Fallo en enrutamiento lógico: {str(e)}")
-        try:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "content": "Fallo interno en el motor lógico."
-            }))
-        except:
-            pass
+        logger.error(f"Fallo en enrutamiento: {str(e)}")
         await websocket.close()
 
 ================================================================================
@@ -578,48 +718,6 @@ ARCHIVO: backend\app\core\__init__.py
 ================================================================================
 
 
-
-================================================================================
-ARCHIVO: backend\app\models\domain.py
-================================================================================
-
-from sqlalchemy import Column, Integer, String, Text
-from pgvector.sqlalchemy import Vector
-from app.core.config import Base
-
-class KnowledgeVector(Base):
-    """
-    Modelo ORM para la Bitácora Empírica (Razonamiento Basado en Casos - CBR).
-    Almacena el conocimiento tácito de los operarios y el vector denso para búsquedas semánticas.
-    """
-    __tablename__ = "knowledge_vectors"
-    __table_args__ = {'extend_existing': True}
-    
-    id = Column(Integer, primary_key=True, index=True)
-    author = Column(String(255), nullable=False)
-    symptoms = Column(Text, nullable=False)
-    action_taken = Column(Text, nullable=False)
-    result = Column(Text, nullable=False)
-    # Dimensiones explícitas requeridas por el motor SentenceTransformer
-    embedding = Column(Vector(384))
-
-class DocumentChunk(Base):
-    """
-    Modelo ORM para la Ingesta Normativa (Generación Aumentada por Recuperación - RAG).
-    Almacena los fragmentos de los manuales procesados por IBM Docling.
-    """
-    __tablename__ = "document_chunks"
-    __table_args__ = {'extend_existing': True}
-    
-    id = Column(Integer, primary_key=True, index=True)
-    content = Column(Text, nullable=False)
-    
-    # CORRECCIÓN ARQUITECTÓNICA: Se evade la palabra reservada 'metadata' en el ORM, 
-    # pero se instruye a PostgreSQL a conservar 'metadata' como el nombre real de la columna.
-    doc_metadata = Column("metadata", String(255), nullable=False)
-    
-    # Dimensiones explícitas requeridas por el motor SentenceTransformer
-    embedding = Column(Vector(384))
 
 ================================================================================
 ARCHIVO: backend\app\models\schemas.py
@@ -744,45 +842,45 @@ from app.core.config import Base
 
 class KnowledgeVector(Base):
     """
-    Entidad ORM (Object-Relational Mapping) que representa la base de conocimiento unificada.
-    Almacena tanto la bitácora empírica (CBR) como los manuales teóricos (RAG), diferenciados
-    exclusivamente por la columna 'source_type'.
+    Modelo ORM Unificado para la Bitácora Empírica (CBR) y búsqueda RAG.
+    Consolida las columnas requeridas por el enrutador lógico y los endpoints de inserción.
     """
     __tablename__ = "knowledge_vectors"
-
+    __table_args__ = {'extend_existing': True}
+    
     id = Column(Integer, primary_key=True, index=True)
     
-    content = Column(
-        Text, 
-        nullable=False, 
-        doc="Contenido en texto crudo (caso empírico o chunk de docling)"
-    )
+    # Columnas base para la inferencia híbrida y enrutamiento en cbr_router.py
+    content = Column(Text, nullable=False, doc="Contenido en texto crudo (caso empírico o chunk de docling)")
+    source_type = Column(String(50), nullable=False, index=True, doc="Filtro estricto: 'empirical_case' o 'theoretical_manual'")
+    author = Column(String(255), nullable=True, doc="Identificador del operario o nombre del archivo origen")
     
-    source_type = Column(
-        String(50), 
-        nullable=False, 
-        index=True, 
-        doc="Filtro estricto: 'empirical_case' o 'theoretical_manual'"
-    )
+    # Columnas específicas para el desglose mapeado en el panel de configuración Vue
+    symptoms = Column(Text, nullable=True)
+    action_taken = Column(Text, nullable=True)
+    result = Column(Text, nullable=True)
     
-    author = Column(
-        String(100), 
-        nullable=True, 
-        doc="Identificador del operario o nombre del archivo origen"
-    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), doc="Marca de tiempo de la indexación")
     
-    created_at = Column(
-        DateTime(timezone=True), 
-        server_default=func.now(), 
-        doc="Marca de tiempo de la indexación"
-    )
+    # Dimensiones explícitas requeridas por el motor SentenceTransformer
+    embedding = Column(Vector(384), nullable=False)
+
+class DocumentChunk(Base):
+    """
+    Modelo ORM para la Ingesta Normativa (Generación Aumentada por Recuperación - RAG).
+    Almacena los fragmentos de los manuales procesados por IBM Docling.
+    """
+    __tablename__ = "document_chunks"
+    __table_args__ = {'extend_existing': True}
     
-    # Columna vectorial dimensionada para paraphrase-multilingual-MiniLM-L12-v2
-    embedding = Column(
-        Vector(384), 
-        nullable=False, 
-        doc="Representación matemática del texto en el espacio latente"
-    )
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(Text, nullable=False)
+    
+    # Se evade la palabra reservada 'metadata' en el ORM de Python
+    doc_metadata = Column("metadata", String(255), nullable=False)
+    
+    # Dimensiones explícitas requeridas por el motor SentenceTransformer
+    embedding = Column(Vector(384))
 
 ================================================================================
 ARCHIVO: backend\app\services\cbr_router.py
@@ -925,57 +1023,46 @@ import logging
 from typing import Optional, Dict, Any
 from pathlib import Path
 
-# Las importaciones globales de IBM Docling han sido retiradas de la cabecera 
-# para aislar el hilo principal de Uvicorn y aplicar inicialización diferida (Lazy Loading).
-
 logger = logging.getLogger(__name__)
 
 class DoclingProcessor:
     """
-    Servicio encargado de ingerir documentos técnicos en formato PDF (manuales O&M, normativas)
-    y decodificarlos estructuralmente a formato Markdown utilizando IBM Docling, 
-    preservando la integridad de las tablas fisicoquímicas y la jerarquía de títulos.
+    Servicio encargado de ingerir documentos técnicos en formato PDF (manuales O&M, normativas).
+    Debido a bloqueos silenciosos (deadlocks) del motor IBM Docling en contenedores aislados, 
+    se prioriza el motor PyPDFium2 (LangChain) para garantizar la extracción de texto en segundos.
+    La arquitectura original de Docling se preserva intacta como un motor de contingencia futuro.
     """
 
     def __init__(self):
-        # Inicialización en nulo del convertidor de documentos para proteger el servidor
         self.converter = None
 
     def _get_converter(self):
         """
-        Importa e instancia el motor de conversión únicamente cuando se recibe el primer documento.
-        Evade dependencias obsoletas como 'InputFormat' ajustándose a la API moderna de Docling.
+        Importa e instancia el motor de conversión.
         """
         if self.converter is None:
-            logger.info("Importando motor IBM Docling y modelos en tiempo de ejecución...")
+            logger.info("Importando motor IBM Docling...")
             try:
                 from docling.document_converter import DocumentConverter
-                from docling.datamodel.pipeline_options import PdfPipelineOptions
-                
-                # Configuración de las opciones del pipeline para PDFs
-                pipeline_options = PdfPipelineOptions()
-                pipeline_options.do_table_structure = True
-                pipeline_options.do_ocr = True
-                
-                # Inicialización del convertidor de documentos (soporta PDF de forma nativa)
-                # Se omite allowed_formats=[InputFormat.PDF] para prevenir el ImportError de rutas obsoletas.
-                self.converter = DocumentConverter()
-                
-                logger.info("IBM Docling DocumentConverter inicializado correctamente.")
+                try:
+                    from docling.datamodel.pipeline_options import PdfPipelineOptions
+                    pipeline_options = PdfPipelineOptions()
+                    pipeline_options.do_table_structure = True
+                    pipeline_options.do_ocr = True
+                    self.converter = DocumentConverter(pdf_pipeline_options=pipeline_options)
+                    logger.info("IBM Docling inicializado con soporte OCR extendido.")
+                except Exception as fallback_e:
+                    logger.warning(f"Opciones avanzadas Docling no disponibles ({str(fallback_e)}). Usando base.")
+                    self.converter = DocumentConverter()
             except Exception as e:
-                logger.error(f"Error crítico al inicializar Docling: {str(e)}")
-                raise e
+                logger.error(f"Fallo al inicializar Docling: {str(e)}")
+                self.converter = None
         return self.converter
 
     async def process_pdf_to_markdown(self, file_path: str) -> Dict[str, Any]:
         """
-        Procesa un archivo PDF almacenado localmente y retorna su representación en Markdown.
-        
-        Args:
-            file_path (str): Ruta absoluta o relativa al archivo PDF.
-            
-        Returns:
-            Dict[str, Any]: Diccionario con el contenido estructurado y metadatos del procesamiento.
+        Procesa un archivo PDF almacenado localmente y retorna su representación en texto crudo.
+        Se ejecuta PyPDFium2 como motor principal para evadir el deadlock. Docling queda relegado a fallback.
         """
         start_time = time.time()
         
@@ -983,57 +1070,82 @@ class DoclingProcessor:
             logger.error(f"El archivo {file_path} no fue encontrado en el sistema de archivos.")
             raise FileNotFoundError(f"Archivo no encontrado: {file_path}")
 
-        logger.info(f"Iniciando decodificación estructural del documento: {file_path}")
+        logger.info(f"Iniciando extracción estructural del documento: {file_path}")
+
+        text_content = ""
+        used_engine = ""
 
         try:
-            # Invoca el método de importación diferida en tiempo real
-            converter = self._get_converter()
+            # MOTOR PRINCIPAL: PyPDFium2Loader de LangChain (Alta velocidad y robustez en Docker)
+            from langchain_community.document_loaders import PyPDFium2Loader
+            logger.info("Usando motor de extracción de alto rendimiento (PyPDFium2)...")
+            loader = PyPDFium2Loader(file_path)
+            docs = loader.load()
+            text_content = "\n\n".join([doc.page_content for doc in docs])
+            used_engine = "langchain_pypdfium2"
             
-            # La conversión en Docling puede ser un proceso bloqueante pesado.
-            # En un entorno de producción estricto con FastAPI, esto podría envolverse en run_in_threadpool
-            conversion_result = converter.convert(file_path)
+        except Exception as pypdfium2_err:
+            logger.error(f"Fallo en motor PyPDFium2: {str(pypdfium2_err)}. Intentando con motor original Docling...")
             
-            # Exportar el documento decodificado a formato Markdown
-            markdown_content = conversion_result.document.export_to_markdown()
-            
-            end_time = time.time()
-            processing_time = round(end_time - start_time, 2)
-            
-            logger.info(f"Documento procesado exitosamente en {processing_time} segundos.")
-            
-            return {
-                "status": "success",
-                "filename": Path(file_path).name,
-                "markdown_content": markdown_content,
-                "processing_time_seconds": processing_time,
-                "metadata": {
-                    "source_type": "theoretical_manual",
-                    "original_format": "application/pdf",
-                    "conversion_engine": "ibm_docling"
-                }
-            }
+            try:
+                # MOTOR SECUNDARIO: IBM Docling (Arquitectura estructural original)
+                converter = self._get_converter()
+                
+                if converter is None:
+                    raise RuntimeError("El motor Docling no pudo inicializarse por fallos de dependencias.")
+                    
+                conversion_result = converter.convert(file_path)
+                text_content = conversion_result.document.export_to_markdown()
+                used_engine = "ibm_docling"
+                
+            except Exception as docling_err:
+                logger.error(f"Fallo en motor Docling: {str(docling_err)}. Intentando con PyPDFLoader...")
+                
+                try:
+                    # MOTOR DE CONTINGENCIA FINAL: PyPDFLoader (Motor universal puro Python)
+                    from langchain_community.document_loaders import PyPDFLoader
+                    loader = PyPDFLoader(file_path)
+                    docs = loader.load()
+                    text_content = "\n\n".join([doc.page_content for doc in docs])
+                    used_engine = "langchain_pypdf"
+                except Exception as final_err:
+                    end_time = time.time()
+                    logger.error(f"Fallo total en extracción: {str(final_err)}")
+                    return {
+                        "status": "error",
+                        "filename": Path(file_path).name,
+                        "error_message": f"Fallo en todos los motores de extracción. Último error: {str(final_err)}",
+                        "processing_time_seconds": round(end_time - start_time, 2)
+                    }
 
-        except Exception as e:
-            end_time = time.time()
-            logger.error(f"Fallo durante la conversión del documento {file_path}. Error: {str(e)}")
+        end_time = time.time()
+        processing_time = round(end_time - start_time, 2)
+        
+        if not text_content or not text_content.strip():
             return {
                 "status": "error",
                 "filename": Path(file_path).name,
-                "error_message": str(e),
-                "processing_time_seconds": round(end_time - start_time, 2)
+                "error_message": "El motor no encontró texto extraíble (posible PDF escaneado sin OCR).",
+                "processing_time_seconds": processing_time
             }
+            
+        logger.info(f"Documento procesado exitosamente por {used_engine} en {processing_time} segundos.")
+        
+        return {
+            "status": "success",
+            "filename": Path(file_path).name,
+            "markdown_content": text_content,
+            "processing_time_seconds": processing_time,
+            "metadata": {
+                "source_type": "theoretical_manual",
+                "original_format": "application/pdf",
+                "conversion_engine": used_engine
+            }
+        }
 
     def save_markdown_to_disk(self, markdown_content: str, output_path: str) -> bool:
         """
-        Utilidad para guardar el Markdown generado en el disco duro, útil para
-        auditoría manual antes de pasarlo al Chunking.
-        
-        Args:
-            markdown_content (str): El texto estructurado en Markdown.
-            output_path (str): Ruta de destino para el archivo .md
-            
-        Returns:
-            bool: True si se guardó correctamente, False en caso contrario.
+        Utilidad para guardar el Markdown generado en el disco duro.
         """
         try:
             with open(output_path, "w", encoding="utf-8") as file:
@@ -1044,7 +1156,6 @@ class DoclingProcessor:
             logger.error(f"Error de E/S al escribir el archivo Markdown en {output_path}: {str(e)}")
             return False
 
-# Instancia global del procesador para ser importada por los controladores (Singleton pattern)
 docling_service = DoclingProcessor()
 
 ================================================================================
@@ -1334,25 +1445,33 @@ ARCHIVO: frontend\src\App.vue
   <div class="app-layout">
     <header class="top-nav">
       <h1>Sistema Inteligente de Gestión del Conocimiento PTAR</h1>
-      <span class="version">Arquitectura Híbrida CBR/RAG v1.0</span>
+      <div class="nav-controls">
+        <span class="version">v1.0.0</span>
+        <button class="btn-config" @click="isConfigOpen = true" title="Configuraciones y Gestión">
+          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+      </div>
     </header>
 
     <main class="main-content">
-      <!-- Columna Izquierda: Panel de Control y Captura de Datos -->
       <aside class="control-panel">
         <Equalizer @update-settings="handleSettingsUpdate" />
         <Dropzone />
         <CaseForm />
       </aside>
 
-      <!-- Columna Derecha: Interfaz de Interacción Continua -->
       <section class="inference-panel">
         <ChatInterface :equalizerSettings="currentSettings" />
       </section>
     </main>
     <footer class="app-footer">
-      developed by Leonardo Valderrama and Gemini version 1.0.0
+       version 1.0.0
     </footer>
+
+    <ConfigModal v-if="isConfigOpen" @close="isConfigOpen = false" />
   </div>
 </template>
 
@@ -1362,21 +1481,21 @@ import Equalizer from './components/Equalizer.vue';
 import Dropzone from './components/Dropzone.vue';
 import CaseForm from './components/CaseForm.vue';
 import ChatInterface from './components/ChatInterface.vue';
+import ConfigModal from './components/ConfigModal.vue';
 
-// Estado global para las configuraciones del ecualizador
+const isConfigOpen = ref(false);
+
 const currentSettings = ref({
   userProfile: 'operator',
-  similarityThreshold: 0.85
+  similarityThreshold: 0.50
 });
 
-// Receptor del evento emitido por Equalizer.vue
 const handleSettingsUpdate = (newSettings) => {
   currentSettings.value = newSettings;
 };
 </script>
 
 <style>
-/* Estilos globales y reset aplicados al contenedor principal */
 *, *::before, *::after {
   box-sizing: border-box;
 }
@@ -1417,10 +1536,34 @@ html, body {
   letter-spacing: 0.5px;
 }
 
+.nav-controls {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
 .version {
   font-size: 0.85rem;
   opacity: 0.7;
   font-family: monospace;
+}
+
+.btn-config {
+  background: none;
+  border: none;
+  color: #ecf0f1;
+  cursor: pointer;
+  padding: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+  opacity: 0.8;
+}
+
+.btn-config:hover {
+  transform: rotate(45deg);
+  opacity: 1;
 }
 
 .main-content {
@@ -1437,8 +1580,9 @@ html, body {
   flex-direction: column;
   gap: 20px;
   overflow-y: auto;
-  /* Ocultar barra de desplazamiento para estética limpia */
   scrollbar-width: thin;
+  position: relative;
+  z-index: 20;
 }
 
 .control-panel::-webkit-scrollbar {
@@ -1452,7 +1596,10 @@ html, body {
 .inference-panel {
   flex: 1;
   min-width: 0;
+  position: relative;
+  z-index: 10;
 }
+
 .app-footer {
   text-align: right;
   padding: 8px 20px;
@@ -1480,30 +1627,28 @@ ARCHIVO: frontend\src\components\CaseForm.vue
 
 <template>
   <div class="case-form-wrapper">
-    <!-- Botón disparador en el panel lateral -->
     <div class="trigger-container">
       <div class="component-header">
-        <h3>Razonamiento Basado en Casos</h3>
-        <p>Almacenamiento de experiencia tácita operativa.</p>
+        <h3>Bitácora Operativa</h3>
+        <p>Almacenamiento de experiencia tácita en planta.</p>
       </div>
       <button class="btn-open-modal" @click="isModalOpen = true">
         <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="12" y1="5" x2="12" y2="19"></line>
           <line x1="5" y1="12" x2="19" y2="12"></line>
         </svg>
-        Registrar Nueva Bitácora Empírica
+        Registrar Nueva Bitácora
       </button>
     </div>
 
-    <!-- Modal Overlay -->
     <div v-if="isModalOpen" class="modal-overlay" @click.self="closeModal">
       <div class="modal-content">
         <div class="modal-header">
-          <h2>Registro de Bitácora Empírica</h2>
+          <h2>Registro de Bitácora Operativa</h2>
           <button class="btn-close" @click="closeModal">&times;</button>
         </div>
         
-        <p class="modal-description">Documente las intervenciones operativas para alimentar el Razonamiento Basado en Casos (CBR).</p>
+        <p class="modal-description">Documente las fallas y soluciones aplicadas en la planta para conocimiento futuro.</p>
 
         <form @submit.prevent="submitCase" class="cbr-form">
           <div class="form-group">
@@ -1519,7 +1664,7 @@ ARCHIVO: frontend\src\components\CaseForm.vue
           </div>
 
           <div class="form-group">
-            <label for="symptoms">Síntomas del Sistema (Vector de Estado):</label>
+            <label for="symptoms">Síntomas del Sistema:</label>
             <textarea 
               id="symptoms" 
               v-model="formData.symptoms" 
@@ -1531,12 +1676,12 @@ ARCHIVO: frontend\src\components\CaseForm.vue
           </div>
 
           <div class="form-group">
-            <label for="action">Acción Heurística Ejecutada:</label>
+            <label for="action">Acción Ejecutada:</label>
             <textarea 
               id="action" 
               v-model="formData.action_taken" 
               rows="3" 
-              placeholder="¿Qué acciones empíricas realizó? (Ej: Cierre de purga por 2 horas)." 
+              placeholder="¿Qué acciones realizó? (Ej: Cierre de purga por 2 horas)." 
               required
               :disabled="isSubmitting"
             ></textarea>
@@ -1548,17 +1693,24 @@ ARCHIVO: frontend\src\components\CaseForm.vue
               id="result" 
               v-model="formData.result" 
               rows="2" 
-              placeholder="Describa el estado final del reactor tras la acción." 
+              placeholder="Describa el estado final del equipo tras la acción." 
               required
               :disabled="isSubmitting"
             ></textarea>
           </div>
 
+          <div v-if="isSubmitting" class="progress-container">
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill" :style="{ width: progress + '%' }"></div>
+            </div>
+            <span class="progress-text">Guardando información... {{ progress }}%</span>
+          </div>
+
           <div class="form-actions">
             <button type="button" class="btn-cancel" @click="closeModal" :disabled="isSubmitting">Cancelar</button>
             <button type="submit" class="btn-submit" :disabled="isSubmitting">
-              <span v-if="!isSubmitting">Indexar Caso Vectorial</span>
-              <span v-else>Vectorizando...</span>
+              <span v-if="!isSubmitting">Guardar Registro</span>
+              <span v-else>Procesando...</span>
             </button>
           </div>
 
@@ -1585,6 +1737,9 @@ const formData = reactive({
 });
 
 const isSubmitting = ref(false);
+const progress = ref(0);
+let progressInterval = null;
+
 const notification = reactive({
   message: '',
   type: ''
@@ -1594,12 +1749,29 @@ const closeModal = () => {
   if (!isSubmitting.value) {
     isModalOpen.value = false;
     notification.message = '';
+    progress.value = 0;
   }
+};
+
+const simulateProgress = () => {
+  progress.value = 0;
+  progressInterval = setInterval(() => {
+    if (progress.value < 90) {
+      progress.value += Math.floor(Math.random() * 15) + 5;
+      if (progress.value > 90) progress.value = 90;
+    }
+  }, 400);
+};
+
+const stopProgress = () => {
+  clearInterval(progressInterval);
+  progress.value = 100;
 };
 
 const submitCase = async () => {
   isSubmitting.value = true;
   notification.message = '';
+  simulateProgress();
   
   try {
     const response = await api.submitEmpiricalCase({
@@ -1609,8 +1781,9 @@ const submitCase = async () => {
       result: formData.result
     });
     
+    stopProgress();
     notification.type = 'success';
-    notification.message = `Caso empírico indexado exitosamente (ID: ${response.id}).`;
+    notification.message = `Registro guardado exitosamente (ID: ${response.id}).`;
     
     formData.symptoms = '';
     formData.action_taken = '';
@@ -1621,9 +1794,11 @@ const submitCase = async () => {
     }, 2000);
     
   } catch (error) {
+    clearInterval(progressInterval);
+    progress.value = 0;
     notification.type = 'error';
     const serverDetail = error.response?.data?.detail || error.message;
-    notification.message = `Fallo crítico de indexación: ${serverDetail}`;
+    notification.message = `Fallo al guardar: ${serverDetail}`;
   } finally {
     isSubmitting.value = false;
   }
@@ -1675,7 +1850,6 @@ const submitCase = async () => {
   background-color: #27ae60;
 }
 
-/* Estilos del Modal */
 .modal-overlay {
   position: fixed;
   top: 0;
@@ -1762,6 +1936,32 @@ textarea:focus {
   box-shadow: 0 0 0 2px rgba(46, 204, 113, 0.2);
 }
 
+.progress-container {
+  margin-top: 15px;
+  margin-bottom: 15px;
+}
+
+.progress-bar-bg {
+  width: 100%;
+  height: 8px;
+  background-color: #ecf0f1;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 5px;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background-color: #2ecc71;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: 0.8rem;
+  color: #7f8c8d;
+  font-weight: bold;
+}
+
 .form-actions {
   display: flex;
   justify-content: flex-end;
@@ -1834,15 +2034,15 @@ ARCHIVO: frontend\src\components\ChatInterface.vue
           <p class="text-body">{{ msg.content }}</p>
           
           <div v-if="msg.role === 'assistant' && msg.metadata" class="metadata-box">
-            <span class="strategy-badge" :class="msg.metadata.routing_strategy">
-              Estrategia Aplicada: {{ msg.metadata.routing_strategy }}
+            <span class="strategy-badge" :class="msg.metadata.routing_strategy === 'Manuales y Normativa' ? 'RAG' : 'CBR'">
+              Fuente: {{ msg.metadata.routing_strategy }}
             </span>
             <details v-if="msg.metadata.sources && msg.metadata.sources.length > 0">
-              <summary>Fuentes Recuperadas ({{ msg.metadata.sources.length }})</summary>
+              <summary>Archivos Recuperados ({{ msg.metadata.sources.length }})</summary>
               <ul class="sources-list">
                 <li v-for="(source, idx) in msg.metadata.sources" :key="idx">
                   <strong>Origen:</strong> {{ source.author }} <br>
-                  <strong>Similitud:</strong> {{(source.similarity * 100).toFixed(2)}}%
+                  <strong>Nivel de coincidencia:</strong> {{(source.similarity * 100).toFixed(2)}}%
                 </li>
               </ul>
             </details>
@@ -1900,7 +2100,6 @@ const connectWebSocket = () => {
   connectionStatus.value = 'connecting';
   connectionStatusText.value = 'Conectando al Motor Local...';
   
-  // CORRECCIÓN ESTRUCTURAL: Se apunta al nuevo puerto 8055 del backend
   socket = new WebSocket('ws://localhost:8055/ws/v1/stream');
 
   socket.onopen = () => {
@@ -1911,25 +2110,25 @@ const connectWebSocket = () => {
   socket.onmessage = (event) => {
     const data = JSON.parse(event.data);
 
-    if (data.error) {
-      messages.value.push({ role: 'assistant', content: `[Error del Servidor]: ${data.error}` });
+    // CORRECCIÓN: Verifica el tipo exacto enviado por el backend
+    if (data.type === 'error') {
+      messages.value.push({ role: 'assistant', content: `[Error del Servidor]: ${data.content}` });
       isTyping.value = false;
       scrollToBottom();
       return;
     }
 
     if (data.type === 'metadata') {
-      // Inicia un nuevo mensaje del asistente con la metadata del CBR/RAG
       messages.value.push({
         role: 'assistant',
         content: '',
         metadata: {
-          routing_strategy: data.routing_strategy,
+          routing_strategy: data.strategy,
           sources: data.sources_used
         }
       });
       currentAssistantMessageIndex = messages.value.length - 1;
-      isTyping.value = false; // Ya empezamos a recibir texto real
+      isTyping.value = false; 
     } 
     else if (data.type === 'token') {
       if (currentAssistantMessageIndex !== -1) {
@@ -1945,13 +2144,12 @@ const connectWebSocket = () => {
   socket.onclose = () => {
     connectionStatus.value = 'disconnected';
     connectionStatusText.value = 'Conexión Perdida. Reconectando...';
-    setTimeout(connectWebSocket, 5000); // Intento de reconexión
+    setTimeout(connectWebSocket, 5000); 
   };
 
   socket.onerror = (error) => {
     connectionStatus.value = 'error';
     connectionStatusText.value = 'Fallo de Red';
-    console.error('WebSocket Error:', error);
   };
 };
 
@@ -1966,9 +2164,9 @@ const sendMessage = () => {
   scrollToBottom();
 
   const payload = {
-    query: query,
-    user_profile: props.equalizerSettings.userProfile,
-    similarity_threshold: props.equalizerSettings.similarityThreshold
+    message: query,
+    profile: props.equalizerSettings.userProfile,
+    threshold: props.equalizerSettings.similarityThreshold
   };
 
   socket.send(JSON.stringify(payload));
@@ -1981,7 +2179,6 @@ const scrollToBottom = async () => {
   }
 };
 
-// Auto-scroll durante el stream de tokens
 watch(messages, () => {
   if (currentAssistantMessageIndex !== -1) {
     scrollToBottom();
@@ -2179,14 +2376,481 @@ textarea:focus {
 </style>
 
 ================================================================================
+ARCHIVO: frontend\src\components\ConfigModal.vue
+================================================================================
+
+<template>
+  <div class="modal-overlay" @click.self="$emit('close')">
+    <div class="modal-content config-modal">
+      <div class="modal-header">
+        <h2>Configuración del Sistema</h2>
+        <button class="btn-close" @click="$emit('close')">&times;</button>
+      </div>
+
+      <div class="config-body">
+        <!-- VISTA DE MENÚ PRINCIPAL -->
+        <div v-if="currentView === 'menu'" class="menu-view">
+          <button class="menu-action-btn" @click="openListView">
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <line x1="16" y1="13" x2="8" y2="13"></line>
+              <line x1="16" y1="17" x2="8" y2="17"></line>
+              <polyline points="10 9 9 9 8 9"></polyline>
+            </svg>
+            Gestión de Bitácora
+          </button>
+        </div>
+
+        <!-- VISTA DE LISTA COMPACTA -->
+        <div v-else-if="currentView === 'list'" class="list-view">
+          <div class="view-header">
+            <button class="btn-back" @click="currentView = 'menu'">← Volver</button>
+            <h3>Mapeo del volumen de conocimientos de operarios</h3>
+          </div>
+          
+          <div v-if="isLoading" class="loading-state">Cargando registros...</div>
+          <div v-else-if="error" class="error-state">{{ error }}</div>
+          <div v-else-if="cases.length === 0" class="empty-state">No hay casos registrados en el sistema.</div>
+          
+          <div v-else class="cases-compact-list">
+            <div v-for="c in cases" :key="c.id" class="compact-case-item">
+              <div class="case-info" @click="openDetailView(c)">
+                <span class="c-id">ID: {{ c.id }}</span>
+                <span class="c-author">{{ c.author }}</span>
+                <span class="c-date" v-if="c.created_at">{{ new Date(c.created_at).toLocaleDateString() }}</span>
+              </div>
+              <div class="case-quick-actions">
+                <button @click.stop="openEditView(c)" class="icon-btn" title="Editar">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#3498db" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
+                </button>
+                <button @click.stop="confirmDelete(c.id)" class="icon-btn" title="Eliminar">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#e74c3c" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- VISTA DE DETALLE O EDICIÓN -->
+        <div v-else-if="currentView === 'detail' || currentView === 'edit'" class="detail-view">
+          <div class="view-header">
+            <button class="btn-back" @click="currentView = 'list'">← Volver a la lista</button>
+            <h3 v-if="currentView === 'detail'">Detalle del Registro ID: {{ activeCase.id }}</h3>
+            <h3 v-else>Modificando Registro ID: {{ activeCase.id }}</h3>
+          </div>
+
+          <!-- MODO DETALLE (SOLO LECTURA) -->
+          <div v-if="currentView === 'detail'" class="case-details">
+            <div class="detail-row">
+              <strong>Autor:</strong> <span>{{ activeCase.author }}</span>
+            </div>
+            <div class="detail-row">
+              <strong>Síntomas:</strong> <span>{{ activeCase.symptoms }}</span>
+            </div>
+            <div class="detail-row">
+              <strong>Acción Ejecutada:</strong> <span>{{ activeCase.action_taken }}</span>
+            </div>
+            <div class="detail-row">
+              <strong>Resultado:</strong> <span>{{ activeCase.result }}</span>
+            </div>
+          </div>
+
+          <!-- MODO EDICIÓN -->
+          <div v-if="currentView === 'edit'" class="case-details edit-form">
+            <div class="form-group">
+              <label>Autor:</label>
+              <input type="text" v-model="editForm.author" :disabled="isActionPending" />
+            </div>
+            <div class="form-group">
+              <label>Síntomas:</label>
+              <textarea v-model="editForm.symptoms" rows="3" :disabled="isActionPending"></textarea>
+            </div>
+            <div class="form-group">
+              <label>Acción Ejecutada:</label>
+              <textarea v-model="editForm.action_taken" rows="3" :disabled="isActionPending"></textarea>
+            </div>
+            <div class="form-group">
+              <label>Resultado Operativo:</label>
+              <textarea v-model="editForm.result" rows="3" :disabled="isActionPending"></textarea>
+            </div>
+            <div class="form-actions">
+              <button class="btn-save" @click="saveEdit" :disabled="isActionPending">
+                {{ isActionPending ? 'Guardando...' : 'Guardar Cambios' }}
+              </button>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, reactive } from 'vue';
+import api from '../services/api.js';
+
+defineEmits(['close']);
+
+const currentView = ref('menu'); // 'menu', 'list', 'detail', 'edit'
+const cases = ref([]);
+const isLoading = ref(false);
+const error = ref('');
+const isActionPending = ref(false);
+
+const activeCase = ref(null);
+const editForm = reactive({
+  author: '',
+  symptoms: '',
+  action_taken: '',
+  result: ''
+});
+
+const fetchCases = async () => {
+  isLoading.value = true;
+  error.value = '';
+  try {
+    const response = await api.getEmpiricalCases();
+    cases.value = response.data || [];
+  } catch (err) {
+    error.value = 'Fallo de red al intentar recuperar los casos almacenados.';
+  } finally {
+    isLoading.value = false;
+  }
+};
+
+const openListView = async () => {
+  currentView.value = 'list';
+  await fetchCases();
+};
+
+const openDetailView = (c) => {
+  activeCase.value = c;
+  currentView.value = 'detail';
+};
+
+const openEditView = (c) => {
+  activeCase.value = c;
+  editForm.author = c.author;
+  editForm.symptoms = c.symptoms;
+  editForm.action_taken = c.action_taken;
+  editForm.result = c.result;
+  currentView.value = 'edit';
+};
+
+const confirmDelete = async (id) => {
+  if (confirm('Esta acción eliminará permanentemente el registro. ¿Desea proceder?')) {
+    isActionPending.value = true;
+    try {
+      await api.deleteEmpiricalCase(id);
+      await fetchCases();
+    } catch (err) {
+      alert('Error al intentar eliminar el caso.');
+    } finally {
+      isActionPending.value = false;
+    }
+  }
+};
+
+const saveEdit = async () => {
+  if (!editForm.author || !editForm.symptoms || !editForm.action_taken || !editForm.result) {
+    alert("Todos los campos son obligatorios.");
+    return;
+  }
+  isActionPending.value = true;
+  try {
+    await api.updateEmpiricalCase(activeCase.value.id, {
+      author: editForm.author,
+      symptoms: editForm.symptoms,
+      action_taken: editForm.action_taken,
+      result: editForm.result
+    });
+    await fetchCases();
+    currentView.value = 'list';
+  } catch (err) {
+    alert('Fallo durante la actualización.');
+  } finally {
+    isActionPending.value = false;
+  }
+};
+</script>
+
+<style scoped>
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background-color: rgba(0, 0, 0, 0.6);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 2000;
+}
+
+.config-modal {
+  background-color: white;
+  padding: 30px;
+  border-radius: 12px;
+  width: 90%;
+  max-width: 800px;
+  min-height: 400px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 2px solid #34495e;
+  padding-bottom: 10px;
+  margin-bottom: 20px;
+}
+
+.modal-header h2 {
+  margin: 0;
+  color: #2c3e50;
+  font-size: 1.4rem;
+}
+
+.btn-close {
+  background: none;
+  border: none;
+  font-size: 1.8rem;
+  color: #7f8c8d;
+  cursor: pointer;
+}
+
+.btn-close:hover {
+  color: #e74c3c;
+}
+
+.config-body {
+  overflow-y: auto;
+  flex: 1;
+}
+
+/* MENU VIEW */
+.menu-view {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 15px;
+}
+
+.menu-action-btn {
+  background-color: #f8f9fa;
+  border: 1px solid #d5dbdb;
+  border-radius: 8px;
+  padding: 20px;
+  font-size: 1.1rem;
+  color: #2c3e50;
+  font-weight: bold;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  transition: all 0.2s;
+}
+
+.menu-action-btn:hover {
+  background-color: #ebf5fb;
+  border-color: #3498db;
+  color: #3498db;
+}
+
+/* HEADER SECUNDARIO */
+.view-header {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  margin-bottom: 20px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #ecf0f1;
+}
+
+.view-header h3 {
+  margin: 0;
+  color: #2980b9;
+  font-size: 1.1rem;
+}
+
+.btn-back {
+  background-color: #ecf0f1;
+  border: none;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: #34495e;
+  font-weight: bold;
+}
+
+.btn-back:hover {
+  background-color: #bdc3c7;
+}
+
+/* LISTA COMPACTA */
+.cases-compact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.compact-case-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: #fdfefe;
+  border: 1px solid #d5dbdb;
+  border-radius: 6px;
+  padding: 10px 15px;
+  transition: background-color 0.2s;
+}
+
+.compact-case-item:hover {
+  background-color: #f4f6f7;
+}
+
+.case-info {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex: 1;
+  cursor: pointer;
+}
+
+.c-id {
+  font-weight: bold;
+  color: #8e44ad;
+  min-width: 60px;
+}
+
+.c-author {
+  font-weight: bold;
+  color: #2c3e50;
+}
+
+.c-date {
+  color: #7f8c8d;
+  font-size: 0.85rem;
+}
+
+.case-quick-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.icon-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 5px;
+  border-radius: 4px;
+  transition: background-color 0.2s;
+}
+
+.icon-btn:hover {
+  background-color: #e0e6ed;
+}
+
+/* DETALLE Y EDICION */
+.case-details {
+  background-color: #fdfefe;
+  border: 1px solid #d5dbdb;
+  border-radius: 6px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.detail-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.detail-row strong {
+  color: #2c3e50;
+  font-size: 0.9rem;
+  text-transform: uppercase;
+}
+
+.detail-row span {
+  color: #34495e;
+  line-height: 1.5;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.form-group label {
+  font-size: 0.9rem;
+  font-weight: bold;
+  color: #2c3e50;
+}
+
+.form-group input, .form-group textarea {
+  padding: 10px;
+  border: 1px solid #bdc3c7;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.95rem;
+}
+
+.form-group input:focus, .form-group textarea:focus {
+  outline: none;
+  border-color: #3498db;
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.btn-save {
+  background-color: #2ecc71;
+  color: white;
+  border: none;
+  padding: 10px 20px;
+  font-weight: bold;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.btn-save:hover:not(:disabled) {
+  background-color: #27ae60;
+}
+
+.loading-state, .error-state, .empty-state {
+  text-align: center;
+  padding: 30px;
+  color: #7f8c8d;
+}
+
+.error-state {
+  color: #e74c3c;
+}
+</style>
+
+================================================================================
 ARCHIVO: frontend\src\components\Dropzone.vue
 ================================================================================
 
 <template>
   <div class="dropzone-container">
     <div class="component-header">
-      <h3>Ingesta Normativa (RAG)</h3>
-      <p>Vectorización de manuales técnicos y resoluciones gubernamentales.</p>
+      <h3>Ingesta Normativa</h3>
+      <p>Procesamiento masivo de manuales técnicos y normativas.</p>
     </div>
 
     <div 
@@ -2195,12 +2859,24 @@ ARCHIVO: frontend\src\components\Dropzone.vue
       @dragover.prevent="isDragging = true"
       @dragleave.prevent="isDragging = false"
       @drop.prevent="handleDrop"
-      @click="triggerFileInput"
     >
+      <!-- Input oculto para múltiples archivos sueltos -->
       <input 
         type="file" 
         ref="fileInput" 
         accept="application/pdf" 
+        multiple
+        style="display: none;" 
+        @change="handleFileSelect"
+      />
+      <!-- Input oculto para carpetas enteras -->
+      <input 
+        type="file" 
+        ref="folderInput" 
+        accept="application/pdf" 
+        webkitdirectory 
+        directory 
+        multiple
         style="display: none;" 
         @change="handleFileSelect"
       />
@@ -2212,20 +2888,24 @@ ARCHIVO: frontend\src\components\Dropzone.vue
           <line x1="12" y1="18" x2="12" y2="12"></line>
           <line x1="9" y1="15" x2="15" y2="15"></line>
         </svg>
-        <p v-if="!selectedFile">Arrastre un archivo PDF aquí, o haga clic para seleccionar.</p>
-        <p v-else class="selected-file-name">Documento cargado: {{ selectedFile.name }}</p>
-        <small>Solo se procesarán documentos teóricos para el fallback estructurado.</small>
+        <p v-if="selectedFiles.length === 0">Arrastre PDFs aquí</p>
+        <p v-else class="selected-file-name">{{ selectedFiles.length }} archivo(s) PDF detectado(s) en espera.</p>
+        
+        <div class="manual-triggers" v-if="selectedFiles.length === 0">
+          <button class="btn-trigger" @click.stop="triggerFileInput">Seleccionar Archivos</button>
+          <button class="btn-trigger" @click.stop="triggerFolderInput">Seleccionar Carpeta</button>
+        </div>
       </div>
 
       <div v-else class="processing-content">
         <div class="spinner"></div>
-        <p>Procesando con IBM Docling...</p>
-        <small>Extrayendo tablas, ejecutando chunking y vectorizando texto.</small>
+        <p>Procesando lote de documentos...</p>
+        <small>Por favor no cierre esta ventana.</small>
       </div>
     </div>
 
-    <div class="action-bar" v-if="selectedFile && !isProcessing">
-      <button class="btn-process" @click="processFile">Procesar e Indexar Documento</button>
+    <div class="action-bar" v-if="selectedFiles.length > 0 && !isProcessing">
+      <button class="btn-process" @click="processFiles">Procesar {{ selectedFiles.length }} Documentos</button>
       <button class="btn-cancel" @click="clearSelection">Cancelar</button>
     </div>
 
@@ -2244,55 +2924,69 @@ const isProcessing = ref(false);
 const resultMessage = ref('');
 const resultType = ref('');
 const fileInput = ref(null);
-const selectedFile = ref(null);
+const folderInput = ref(null);
+const selectedFiles = ref([]);
 
 const triggerFileInput = () => {
-  if (!isProcessing.value) {
-    fileInput.value.click();
+  if (!isProcessing.value) fileInput.value.click();
+};
+
+const triggerFolderInput = () => {
+  if (!isProcessing.value) folderInput.value.click();
+};
+
+const filterPdfs = (filesArray) => {
+  const pdfs = [];
+  for (let i = 0; i < filesArray.length; i++) {
+    if (filesArray[i].type === 'application/pdf' || filesArray[i].name.toLowerCase().endsWith('.pdf')) {
+      pdfs.push(filesArray[i]);
+    }
   }
+  return pdfs;
 };
 
 const handleDrop = (event) => {
   isDragging.value = false;
-  const files = event.dataTransfer.files;
-  if (files.length > 0 && files[0].type === 'application/pdf') {
-    selectedFile.value = files[0];
+  const droppedPdfs = filterPdfs(event.dataTransfer.files);
+  if (droppedPdfs.length > 0) {
+    selectedFiles.value = droppedPdfs;
     resultMessage.value = '';
   } else {
     resultType.value = 'error';
-    resultMessage.value = 'Formato inválido. Solo se admiten archivos PDF.';
+    resultMessage.value = 'No se detectaron archivos PDF válidos en la selección.';
   }
 };
 
 const handleFileSelect = (event) => {
-  const files = event.target.files;
-  if (files.length > 0) {
-    selectedFile.value = files[0];
+  const selected = filterPdfs(event.target.files);
+  if (selected.length > 0) {
+    selectedFiles.value = selected;
     resultMessage.value = '';
   }
   fileInput.value.value = '';
+  folderInput.value.value = '';
 };
 
 const clearSelection = () => {
-  selectedFile.value = null;
+  selectedFiles.value = [];
   resultMessage.value = '';
 };
 
-const processFile = async () => {
-  if (!selectedFile.value) return;
+const processFiles = async () => {
+  if (selectedFiles.value.length === 0) return;
 
   isProcessing.value = true;
   resultMessage.value = '';
 
   try {
-    const response = await api.uploadManual(selectedFile.value);
+    const response = await api.uploadManual(selectedFiles.value);
     resultType.value = 'success';
-    resultMessage.value = `Documento vectorizado en ${response.processing_time_seconds}s. Chunks creados: ${response.chunks_created}.`;
-    selectedFile.value = null;
+    resultMessage.value = `Procesamiento exitoso. ${response.files_processed} documentos vectorizados en ${response.processing_time_seconds}s. Total fragmentos: ${response.chunks_created}.`;
+    selectedFiles.value = [];
   } catch (error) {
     resultType.value = 'error';
     const serverDetail = error.response?.data?.detail || error.message;
-    resultMessage.value = `Error en el procesamiento: ${serverDetail}`;
+    resultMessage.value = `Error crítico procesando el lote: ${serverDetail}`;
   } finally {
     isProcessing.value = false;
   }
@@ -2326,9 +3020,8 @@ const processFile = async () => {
 .drop-area {
   border: 2px dashed #bdc3c7;
   border-radius: 8px;
-  padding: 30px 20px;
+  padding: 20px 10px;
   text-align: center;
-  cursor: pointer;
   transition: all 0.3s ease;
   background-color: #f9fbfd;
 }
@@ -2346,7 +3039,7 @@ const processFile = async () => {
 }
 
 .drop-content p, .processing-content p {
-  margin: 10px 0 5px;
+  margin: 10px 0 10px;
   color: #2c3e50;
   font-weight: 500;
 }
@@ -2356,8 +3049,29 @@ const processFile = async () => {
   font-weight: bold !important;
 }
 
-.drop-content small, .processing-content small {
-  color: #7f8c8d;
+.manual-triggers {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  margin-top: 15px;
+}
+
+.btn-trigger {
+  background-color: #ecf0f1;
+  border: 1px solid #bdc3c7;
+  color: #34495e;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: bold;
+  transition: background-color 0.2s;
+  width: 80%;
+}
+
+.btn-trigger:hover {
+  background-color: #d5dbdb;
 }
 
 .spinner {
@@ -2377,12 +3091,12 @@ const processFile = async () => {
 
 .action-bar {
   display: flex;
+  flex-direction: column;
   gap: 10px;
   margin-top: 15px;
 }
 
 .btn-process {
-  flex: 1;
   background-color: #3498db;
   color: white;
   border: none;
@@ -2439,50 +3153,80 @@ ARCHIVO: frontend\src\components\Equalizer.vue
 <template>
   <div class="equalizer-container">
     <div class="component-header">
-      <h3>Ecualizador de Personalidad</h3>
-      <p>Ajuste de parámetros de inferencia y umbral CBR.</p>
+      <h3>Ajustes de Inferencia</h3>
+      <p>Configuración del comportamiento del sistema.</p>
     </div>
 
+    <!-- CONTROL: PERFIL DEL ASISTENTE -->
     <div class="control-group">
-      <label for="profile-select">Perfil Lingüístico del LLM:</label>
+      <label class="label-with-help">
+        Perfil del Asistente:
+        <button class="help-btn" @click.stop="(e) => togglePopover('profile', e)">?</button>
+      </label>
       <select id="profile-select" v-model="settings.userProfile" @change="emitUpdate">
-        <option value="operator">Supervisor Operativo (Lenguaje directo y heurístico)</option>
-        <option value="engineer">Ingeniero Ambiental (Rigor científico y termodinámico)</option>
+        <option value="operator">Supervisor Operativo (Lenguaje directo)</option>
+        <option value="engineer">Ingeniero Ambiental (Rigor científico)</option>
       </select>
-      <small class="helper-text">Modifica el System Prompt y la temperatura generativa.</small>
     </div>
 
+    <!-- CONTROL: PRECISIÓN DE BÚSQUEDA -->
     <div class="control-group">
-      <label for="threshold-slider">Umbral de Similitud CBR ({{ settings.similarityThreshold }}):</label>
+      <label class="label-with-help">
+        Precisión de Búsqueda Histórica ({{ settings.similarityThreshold }}):
+        <button class="help-btn" @click.stop="(e) => togglePopover('precision', e)">?</button>
+      </label>
       <input 
         type="range" 
         id="threshold-slider" 
-        min="0.5" 
+        min="0.2" 
         max="0.99" 
         step="0.01" 
         v-model.number="settings.similarityThreshold" 
         @input="emitUpdate"
       />
       <div class="slider-labels">
-        <span>Más tolerante (RAG)</span>
-        <span>Más estricto (CBR puro)</span>
+        <span>Más tolerante</span>
+        <span>Más estricto</span>
       </div>
-      <small class="helper-text">
-        Define la distancia del coseno requerida para aceptar un caso empírico previo antes de consultar los manuales.
-      </small>
     </div>
+
+    <!-- PORTAL DE BURBUJAS DE AYUDA AL BODY -->
+    <Teleport to="body">
+      <div v-if="activePopover === 'profile'" class="popover-content" :style="popoverStyle" @click.stop>
+        <div class="popover-arrow"></div>
+        <h4>Comportamiento del Asistente</h4>
+        <p>El perfil ajusta la forma en que el sistema analiza la información y se comunica con usted:</p>
+        <ul>
+          <li><strong>Supervisor Operativo:</strong> Se enfoca en la práctica. Le dará instrucciones directas y fáciles de aplicar en campo para resolver el problema sin rodeos teóricos.</li>
+          <li><strong>Ingeniero Ambiental:</strong> Se enfoca en el análisis profundo. Utilizará parámetros de calidad del agua y explicaciones científicas para diagnosticar la raíz de la falla.</li>
+        </ul>
+      </div>
+
+      <div v-if="activePopover === 'precision'" class="popover-content" :style="popoverStyle" @click.stop>
+        <div class="popover-arrow"></div>
+        <h4>Aproximación de Casos</h4>
+        <p>Esta barra controla qué tan exacto debe ser el problema que usted describe comparado con los reportes anteriores almacenados en la bitácora.</p>
+        <ul>
+          <li><strong>Hacia la derecha (Más Estricto):</strong> El sistema priorizará la lectura de documentación oficial, a menos que logre encontrar un caso empírico que sea idéntico a su problema.</li>
+          <li><strong>Hacia la izquierda (Más Tolerante):</strong> El sistema le dará mayor peso a la experiencia de otros operarios, enlazando casos basándose en el contexto, incluso si utilizaron palabras distintas a las suyas.</li>
+        </ul>
+      </div>
+    </Teleport>
   </div>
 </template>
 
 <script setup>
-import { reactive, watch } from 'vue';
+import { reactive, ref, onMounted, onBeforeUnmount } from 'vue';
 
 const emit = defineEmits(['update-settings']);
 
 const settings = reactive({
   userProfile: 'operator',
-  similarityThreshold: 0.85
+  similarityThreshold: 0.50
 });
+
+const activePopover = ref(null);
+const popoverStyle = reactive({ top: '0px', left: '0px' });
 
 const emitUpdate = () => {
   emit('update-settings', {
@@ -2491,8 +3235,30 @@ const emitUpdate = () => {
   });
 };
 
-// Emitir configuración inicial al montar el componente
-emitUpdate();
+const togglePopover = (popoverName, event) => {
+  if (activePopover.value === popoverName) {
+    activePopover.value = null;
+  } else {
+    // Calculamos las coordenadas del botón interactuado de manera absoluta en el documento
+    const rect = event.target.getBoundingClientRect();
+    popoverStyle.top = `${rect.bottom + 12}px`;
+    popoverStyle.left = `${rect.left - 15}px`;
+    activePopover.value = popoverName;
+  }
+};
+
+const closePopovers = () => {
+  activePopover.value = null;
+};
+
+onMounted(() => {
+  document.addEventListener('click', closePopovers);
+  emitUpdate();
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener('click', closePopovers);
+});
 </script>
 
 <style scoped>
@@ -2520,15 +3286,37 @@ emitUpdate();
 }
 
 .control-group {
-  margin-bottom: 15px;
+  margin-bottom: 25px;
 }
 
-label {
-  display: block;
+.label-with-help {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   font-weight: 600;
   margin-bottom: 8px;
   color: #34495e;
   font-size: 0.95rem;
+}
+
+.help-btn {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 20px;
+  height: 20px;
+  background-color: #3498db;
+  color: white;
+  border-radius: 50%;
+  border: none;
+  font-size: 0.85rem;
+  font-weight: bold;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.help-btn:hover {
+  background-color: #2980b9;
 }
 
 select {
@@ -2538,11 +3326,13 @@ select {
   border-radius: 4px;
   font-size: 0.95rem;
   background-color: #f8f9fa;
+  cursor: pointer;
 }
 
 input[type="range"] {
   width: 100%;
   margin-top: 5px;
+  cursor: pointer;
 }
 
 .slider-labels {
@@ -2552,12 +3342,59 @@ input[type="range"] {
   color: #95a5a6;
   margin-top: 5px;
 }
+</style>
 
-.helper-text {
-  display: block;
-  font-size: 0.75rem;
-  color: #7f8c8d;
-  margin-top: 4px;
+<style>
+/* Estilos globales para el portal Teleport */
+.popover-content {
+  position: fixed;
+  width: 320px;
+  background-color: #ffffff;
+  border: 1px solid #bdc3c7;
+  border-radius: 8px;
+  padding: 15px;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+  z-index: 9999;
+  cursor: default;
+}
+
+.popover-arrow {
+  position: absolute;
+  top: -6px;
+  left: 20px;
+  width: 10px;
+  height: 10px;
+  background-color: #ffffff;
+  border-top: 1px solid #bdc3c7;
+  border-left: 1px solid #bdc3c7;
+  transform: rotate(45deg);
+}
+
+.popover-content h4 {
+  margin-top: 0;
+  margin-bottom: 10px;
+  color: #2c3e50;
+  font-size: 0.95rem;
+  border-bottom: 1px solid #ecf0f1;
+  padding-bottom: 5px;
+}
+
+.popover-content p {
+  margin: 0 0 10px 0;
+  color: #34495e;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.popover-content ul {
+  margin: 0;
+  padding-left: 20px;
+  color: #34495e;
+  font-size: 0.85rem;
+}
+
+.popover-content li {
+  margin-bottom: 5px;
 }
 </style>
 
@@ -2567,9 +3404,7 @@ ARCHIVO: frontend\src\services\api.js
 
 import axios from 'axios';
 
-// La URL base asume que el usuario accede al frontend a través de localhost 
-// y el backend expone sus puertos en el host.
-const API_BASE_URL = 'http://localhost:8000/api/v1';
+const API_BASE_URL = 'http://localhost:8055/api/v1';
 
 export const apiClient = axios.create({
     baseURL: API_BASE_URL,
@@ -2579,10 +3414,6 @@ export const apiClient = axios.create({
 });
 
 export default {
-    /**
-     * Envía el reporte empírico a la base de datos vectorial (CBR).
-     * @param {Object} caseData - Objeto con symptoms, action_taken, result, author.
-     */
     async submitEmpiricalCase(caseData) {
         try {
             const response = await apiClient.post('/empirical-case', caseData);
@@ -2594,13 +3425,15 @@ export default {
     },
 
     /**
-     * Sube un manual técnico en formato PDF para ser procesado por IBM Docling.
-     * @param {File} file - Archivo PDF.
+     * Sube múltiples manuales técnicos o el contenido de una carpeta.
+     * @param {Array<File>} files - Arreglo de archivos PDF.
      */
-    async uploadManual(file) {
+    async uploadManual(files) {
         try {
             const formData = new FormData();
-            formData.append('file', file);
+            files.forEach(file => {
+                formData.append('files', file);
+            });
             
             const response = await apiClient.post('/upload-manual', formData, {
                 headers: {
@@ -2609,7 +3442,37 @@ export default {
             });
             return response.data;
         } catch (error) {
-            console.error('Error al subir el manual técnico:', error);
+            console.error('Error al subir los manuales técnicos:', error);
+            throw error;
+        }
+    },
+
+    async getEmpiricalCases() {
+        try {
+            const response = await apiClient.get('/empirical-cases');
+            return response.data;
+        } catch (error) {
+            console.error('Error al obtener los casos empíricos:', error);
+            throw error;
+        }
+    },
+
+    async updateEmpiricalCase(id, caseData) {
+        try {
+            const response = await apiClient.put(`/empirical-cases/${id}`, caseData);
+            return response.data;
+        } catch (error) {
+            console.error(`Error al actualizar el caso ${id}:`, error);
+            throw error;
+        }
+    },
+
+    async deleteEmpiricalCase(id) {
+        try {
+            const response = await apiClient.delete(`/empirical-cases/${id}`);
+            return response.data;
+        } catch (error) {
+            console.error(`Error al eliminar el caso ${id}:`, error);
             throw error;
         }
     }
